@@ -1,0 +1,573 @@
+--- Serves the files of a directory over HTTP.
+---
+--- `static.handler` returns a handler for `network.serve`. Registered on a
+--- `web` scope, the package serves the directory under a prefix of the
+--- scope. A response carries a `Content-Type` from a table of file
+--- extensions, an `ETag`, `Last-Modified`, `Accept-Ranges`, and
+--- `Cache-Control`. Requests with `If-None-Match` or `If-Modified-Since`
+--- are answered with 304, and a request for one byte range with 206. A
+--- path that would leave the root is refused, in its plain and its
+--- percent-encoded forms. Files whose names start with a dot are hidden by
+--- default.
+---
+--- The `ETag` is a hash of the content of the file. `Last-Modified` is the
+--- time at which the handler first saw that content, because the standard
+--- library reports no modification time. Both validators change when the
+--- content changes.
+---
+--- @package static
+--- @version 0.1.0
+--- @lus 2.0
+--- @license 0BSD
+--- @repository https://github.com/lus-lang/atmos-static
+--- @permission fs:read Reads the files under the `root` option.
+
+local M = {}
+
+local type, tostring, tonumber, pairs, ipairs = type, tostring, tonumber, pairs, ipairs
+local concat = table.concat
+
+--- The content type of each file extension, by lowercase extension without
+--- the dot. Add an entry to serve another type.
+M.types = {
+    html = "text/html; charset=utf-8",
+    htm = "text/html; charset=utf-8",
+    css = "text/css; charset=utf-8",
+    js = "text/javascript; charset=utf-8",
+    mjs = "text/javascript; charset=utf-8",
+    json = "application/json; charset=utf-8",
+    map = "application/json; charset=utf-8",
+    webmanifest = "application/manifest+json; charset=utf-8",
+    xml = "application/xml; charset=utf-8",
+    txt = "text/plain; charset=utf-8",
+    md = "text/markdown; charset=utf-8",
+    csv = "text/csv; charset=utf-8",
+    lus = "text/plain; charset=utf-8",
+    svg = "image/svg+xml",
+    png = "image/png",
+    jpg = "image/jpeg",
+    jpeg = "image/jpeg",
+    gif = "image/gif",
+    webp = "image/webp",
+    avif = "image/avif",
+    ico = "image/x-icon",
+    bmp = "image/bmp",
+    woff = "font/woff",
+    woff2 = "font/woff2",
+    ttf = "font/ttf",
+    otf = "font/otf",
+    mp3 = "audio/mpeg",
+    ogg = "audio/ogg",
+    wav = "audio/wav",
+    m4a = "audio/mp4",
+    mp4 = "video/mp4",
+    webm = "video/webm",
+    mov = "video/quicktime",
+    pdf = "application/pdf",
+    zip = "application/zip",
+    gz = "application/gzip",
+    tar = "application/x-tar",
+    wasm = "application/wasm",
+    rss = "application/rss+xml; charset=utf-8",
+    atom = "application/atom+xml; charset=utf-8",
+    yaml = "text/yaml; charset=utf-8",
+    yml = "text/yaml; charset=utf-8",
+    toml = "application/toml; charset=utf-8",
+}
+
+local OCTET = "application/octet-stream"
+
+--- Returns the content type for a file name, a path, or an extension.
+---
+--- The extension is the text after the last dot, compared without regard
+--- to case. A name with an extension outside `static.types`, or with no
+--- extension, gives `application/octet-stream`.
+--- @param name string The file name, path, or extension.
+--- @return string The content type.
+function M.mime(name)
+    local extension = name:match("%.([^./\\]+)$") or name
+    return M.types[extension:lower()] or OCTET
+end
+
+-- HTTP dates ------------------------------------------------------------------------
+
+local DAYS = { [0] = "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" }
+local MONTHS = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
+local MONTH_NUMBERS = {}
+for i, name in ipairs(MONTHS) do
+    MONTH_NUMBERS[name] = i
+end
+
+-- Formats Unix seconds as an HTTP date such as
+-- `Sun, 06 Nov 1994 08:49:37 GMT`.
+local function http_date(seconds)
+    local w, d, m, rest = time.instant(seconds):format("%w %d %m %Y %H:%M:%S"):match("^(%d) (%d+) (%d+) (.*)$")
+    return `$(DAYS[tonumber(w)]), $d $(MONTHS[tonumber(m)]) $rest GMT`
+end
+
+-- Parses an HTTP date into Unix seconds, or returns nil.
+local function parse_http_date(text)
+    local d, mon, y, h, mi, s = text:match("^%a+, (%d%d) (%a%a%a) (%d%d%d%d) (%d%d):(%d%d):(%d%d) GMT$")
+    local m = MONTH_NUMBERS[mon]
+    if m == nil then
+        return nil
+    end
+    local ok, instant = catch time.parse(string.format("%s-%02d-%sT%s:%s:%sZ", y, m, d, h, mi, s))
+    if not ok then
+        return nil
+    end
+    return instant:epoch()
+end
+
+-- Paths ----------------------------------------------------------------------------------
+
+local function hex_value(byte)
+    if byte >= 48 and byte <= 57 then
+        return byte - 48
+    elseif byte >= 65 and byte <= 70 then
+        return byte - 55
+    elseif byte >= 97 and byte <= 102 then
+        return byte - 87
+    end
+    return nil
+end
+
+-- Decodes the percent escapes of a path into bytes and reads the bytes as
+-- UTF-8. Returns nil for a malformed escape or invalid UTF-8.
+local function percent_decode(path)
+    if path:find("%", 1, true) == nil then
+        return path
+    end
+    local bytes = vector.fromstring(path)
+    local size = #bytes
+    local out = vector.create(size)
+    local i, n = 0, 0
+    while i < size do
+        local byte = vector.get(bytes, i)
+        if byte == 37 then
+            if i + 2 >= size then
+                return nil
+            end
+            local high, low = hex_value(vector.get(bytes, i + 1)), hex_value(vector.get(bytes, i + 2))
+            if high == nil or low == nil then
+                return nil
+            end
+            byte = high * 16 + low
+            i = i + 2
+        end
+        vector.set(out, n, byte)
+        n = n + 1
+        i = i + 1
+    end
+    local ok, text = catch vector.tostring(out, 0, n)
+    if not ok then
+        return nil
+    end
+    return text
+end
+
+-- Encodes one path segment for a Location header.
+local function encode_segment(segment)
+    if segment:find("^[%w%-%._~]*$") then
+        return segment
+    end
+    local bytes = vector.fromstring(segment)
+    local parts = {}
+    for i = 0, #bytes - 1 do
+        local byte = vector.get(bytes, i)
+        local char = byte < 128 and string.char(byte) or ""
+        if char:find("^[%w%-%._~]$") then
+            parts[#parts + 1] = char
+        else
+            parts[#parts + 1] = string.format("%%%02X", byte)
+        end
+    end
+    return concat(parts)
+end
+
+-- Splits a request path into the segments of a path below the root.
+-- Returns the segments and whether the path ends with a slash, or nil and
+-- the status that refuses the path.
+local function resolve(path, dotfiles, windows)
+    local decoded = percent_decode(path)
+    if decoded == nil or decoded:find("\0", 1, true) then
+        return nil, 400
+    end
+    if decoded:find("\\", 1, true) then
+        return nil, 403
+    end
+    local segments, n = {}, 0
+    for segment in decoded:gmatch("[^/]+") do
+        if segment == ".." then
+            return nil, 403
+        elseif segment ~= "." then
+            if segment:sub(1, 1) == "." and dotfiles ~= "allow" then
+                return nil, dotfiles == "deny" and 403 or 404
+            end
+            if windows and segment:find(":", 1, true) then
+                return nil, 403
+            end
+            n = n + 1
+            segments[n] = segment
+        end
+    end
+    return segments, decoded:sub(-1) == "/"
+end
+
+-- Responses --------------------------------------------------------------------------------
+
+local TEXT = "text/plain; charset=utf-8"
+
+local function plain(status, text, extra)
+    local headers = { ["Content-Type"] = TEXT }
+    if extra then
+        for k, v in pairs(extra) do
+            headers[k] = v
+        end
+    end
+    return status, text, headers
+end
+
+-- Tells whether an If-None-Match or If-Match style list names `etag`.
+local function etag_listed(list, etag)
+    if list:find("*", 1, true) and list:match("^%s*%*%s*$") then
+        return true
+    end
+    for candidate in list:gmatch('W?/?("[^"]*")') do
+        if candidate == etag then
+            return true
+        end
+    end
+    return false
+end
+
+-- Parses a Range header against a body of `size` bytes. Returns the first
+-- and last offset, false for a range that cannot be satisfied, or nil for
+-- a header to ignore.
+local function parse_range(header, size)
+    local spec = header:match("^bytes=(.*)$")
+    if spec == nil or spec:find(",", 1, true) then
+        return nil
+    end
+    local first, last = spec:match("^%s*(%d*)%-(%d*)%s*$")
+    if first == nil or (first == "" and last == "") then
+        return nil
+    end
+    if first == "" then
+        local suffix = tonumber(last)
+        if suffix == 0 or size == 0 then
+            return false
+        end
+        if suffix > size then
+            suffix = size
+        end
+        return size - suffix, size - 1
+    end
+    local start = tonumber(first)
+    local stop = last == "" and size - 1 or tonumber(last)
+    if last ~= "" and stop < start then
+        return nil
+    end
+    if start >= size then
+        return false
+    end
+    if stop >= size then
+        stop = size - 1
+    end
+    return start, stop
+end
+
+-- The server ----------------------------------------------------------------------------------
+
+local function build(options)
+    if type(options) ~= "table" or type(options.root) ~= "string" or options.root == "" then
+        error("static: the root option must name a directory", 3)
+    end
+    local root = options.root
+    if #root > 1 and root:sub(-1) == "/" then
+        root = root:sub(1, -2)
+    end
+    local ok, kind = catch fs.type(root)
+    if not ok or kind ~= "directory" then
+        error(`static: root '$root' is not a directory`, 3)
+    end
+    local dotfiles = options.dotfiles or "ignore"
+    if dotfiles ~= "ignore" and dotfiles ~= "deny" and dotfiles ~= "allow" then
+        error("static: dotfiles must be 'ignore', 'deny', or 'allow'", 3)
+    end
+    local index = options.index
+    if index == nil then
+        index = { "index.html" }
+    elseif index == false then
+        index = {}
+    elseif type(index) == "string" then
+        index = { index }
+    end
+    local follow_links = options.links == true
+    local fallback = options.fallback
+    local windows = os.platform() == "windows"
+    local cache_control
+    if options.max_age ~= false then
+        cache_control = `public, max-age=$(math.floor(options.max_age or 0))`
+        if options.immutable then
+            cache_control = cache_control .. ", immutable"
+        end
+    end
+    local extra = options.headers
+    local types = M.types
+    local caching = options.cache == true
+    local cache_limit = options.cache_limit or 64 * 1024 * 1024
+    local cached, cached_bytes = {}, 0
+    -- The ETag and the time of the content last seen at each path.
+    local seen = {}
+
+    -- Returns the kind of the entry below the root, or nil when it is
+    -- absent or reached through a symbolic link that the options refuse.
+    local function entry_kind(segments, count)
+        local path = root
+        local entry_ok, entry, link
+        if follow_links then
+            path = count > 0 and (root .. "/" .. concat(segments, "/", 1, count)) or root
+            entry_ok, entry = catch fs.type(path)
+            return entry_ok and entry or nil, path
+        end
+        entry = "directory"
+        for i = 1, count do
+            path = path .. "/" .. segments[i]
+            entry_ok, entry, link = catch fs.type(path)
+            if not entry_ok or link then
+                return nil, path
+            end
+        end
+        return entry, path
+    end
+
+    local function load(path)
+        if entry = cached[path] then
+            return entry
+        end
+        local file = io.open(path, "rb")
+        if file == nil then
+            return nil
+        end
+        local read_ok, body = catch file:read("a")
+        file:close()
+        if not read_ok or body == nil then
+            return nil
+        end
+        local etag = '"' .. string.transcode(crypto.hash("sha256", body), "binary", "hex"):sub(1, 32) .. '"'
+        local memo = seen[path]
+        if memo == nil or memo.etag ~= etag then
+            local at = os.time()
+            memo = { etag = etag, modified = at, date = http_date(at) }
+            seen[path] = memo
+        end
+        local entry = {
+            body = body,
+            size = #body,
+            etag = etag,
+            modified = memo.modified,
+            date = memo.date,
+            mime = types[(path:match("%.([^./]+)$") or ""):lower()] or OCTET,
+        }
+        if caching and cached_bytes + entry.size <= cache_limit then
+            cached[path] = entry
+            cached_bytes = cached_bytes + entry.size
+        end
+        return entry
+    end
+
+    local function base_headers(entry)
+        local headers = {
+            ["Content-Type"] = entry.mime,
+            ETag = entry.etag,
+            ["Last-Modified"] = entry.date,
+            ["Accept-Ranges"] = "bytes",
+            ["Cache-Control"] = cache_control,
+        }
+        if extra then
+            for k, v in pairs(extra) do
+                headers[k] = v
+            end
+        end
+        return headers
+    end
+
+    local function send(entry, method, request)
+        local headers = base_headers(entry)
+        if none_match = request["if-none-match"] then
+            if etag_listed(none_match, entry.etag) then
+                headers["Content-Type"] = nil
+                return 304, "", headers
+            end
+        elseif since_text = request["if-modified-since"] then
+            local since = parse_http_date(since_text)
+            if since and entry.modified <= since then
+                headers["Content-Type"] = nil
+                return 304, "", headers
+            end
+        end
+        local size = entry.size
+        local status, body = 200, entry.body
+        if range = request.range then
+            local condition = request["if-range"]
+            if condition == nil or condition == entry.etag or condition == entry.date then
+                local start, stop = parse_range(range, size)
+                if start == false then
+                    headers["Content-Range"] = `bytes */$(size)`
+                    headers["Content-Type"] = TEXT
+                    return 416, "range not satisfiable", headers
+                elseif start ~= nil then
+                    status = 206
+                    headers["Content-Range"] = `bytes $(start)-$(stop)/$(size)`
+                    body = body[start + 1, stop + 1]
+                end
+            end
+        end
+        if method == "HEAD" then
+            headers["Content-Length"] = tostring(#body)
+            return status, "", headers
+        end
+        return status, body, headers
+    end
+
+    -- Answers the request for `path`, the request path below the prefix.
+    -- `mount` is the prefix, which starts the Location of a redirect.
+    return function(method, path, request, mount)
+        if method ~= "GET" and method ~= "HEAD" then
+            return plain(405, "method not allowed", { Allow = "GET, HEAD" })
+        end
+        local segments, trailing = resolve(path, dotfiles, windows)
+        if segments == nil then
+            local status = trailing
+            return plain(status, status == 400 and "bad request" or status == 403 and "forbidden" or "not found")
+        end
+        local count = #segments
+        if caching and not trailing then
+            -- A file in the cache is served without a look at the disk.
+            if hit = cached[root .. "/" .. concat(segments, "/")] then
+                return send(hit, method, request)
+            end
+        end
+        local entry_type, full = entry_kind(segments, count)
+        if entry_type == "directory" then
+            if not trailing then
+                local encoded = {}
+                for i = 1, count do
+                    encoded[i] = encode_segment(segments[i])
+                end
+                return plain(301, "", { Location = mount .. "/" .. concat(encoded, "/") .. (count > 0 and "/" or "") })
+            end
+            entry_type = nil
+            for _, name in ipairs(index) do
+                segments[count + 1] = name
+                local candidate, candidate_path = entry_kind(segments, count + 1)
+                if candidate == "file" then
+                    entry_type, full = candidate, candidate_path
+                    break
+                end
+            end
+        elseif entry_type == "file" and trailing then
+            entry_type = nil
+        end
+        local entry = entry_type == "file" and load(full) or nil
+        if entry == nil and fallback then
+            local candidate, candidate_path = entry_kind({ fallback }, 1)
+            entry = candidate == "file" and load(candidate_path) or nil
+        end
+        if entry == nil then
+            return plain(404, "not found")
+        end
+        return send(entry, method, request)
+    end
+end
+
+--- Returns a handler for `network.serve` that serves a directory.
+---
+--- The options are the following.
+---
+--- - `root`: the directory to serve. It is required.
+--- - `prefix`: a path prefix such as `"/assets"`. The handler serves the
+---   paths below it and answers every other path with 404.
+--- - `index`: the file served for a directory, by default `"index.html"`.
+---   A list names several candidates in order. `false` turns index
+---   files off. A directory requested without its final slash redirects
+---   to the path with the slash.
+--- - `max_age`: the seconds a client may cache a file, 0 by default. The
+---   response carries `Cache-Control: public, max-age=N`. `false` leaves
+---   the header out.
+--- - `immutable`: `true` adds `immutable` to `Cache-Control`, for files
+---   whose names change with their content.
+--- - `dotfiles`: how to treat a path with a segment that starts with a
+---   dot. `"ignore"` (the default) answers 404, `"deny"` answers 403,
+---   and `"allow"` serves the file.
+--- - `links`: `true` serves files reached through symbolic links. By
+---   default a path with a symbolic link below the root answers 404, so a
+---   link cannot expose a file outside the root.
+--- - `fallback`: a file under the root that is served with status 200
+---   when no file matches, as single-page applications need.
+--- - `headers`: a table of headers added to every file response.
+--- - `cache`: `true` keeps each file in memory after its first read and
+---   serves it from there for the life of the handler. Use it for files
+---   that stay the same while the program runs.
+--- - `cache_limit`: the most bytes the cache holds, 64 MiB by default.
+---   Files beyond the limit are read on every request.
+---
+--- The handler answers `GET` and `HEAD` and refuses other methods with
+--- 405. A path with a `..` segment or a backslash answers 403, whether
+--- the client wrote it plainly or percent-encoded. A path with a
+--- malformed escape, a NUL, or invalid UTF-8 answers 400. A `Range`
+--- header with one range gets a 206 response, or 416 when the range
+--- starts past the end of the file. A header with several ranges gets
+--- the whole file.
+---
+--- A missing `root`, a `root` that is not a directory, and an unknown
+--- `dotfiles` value raise an error.
+--- @param options table The options.
+--- @return function The handler, a function from a request to `status, body, headers`.
+function M.handler(options)
+    local serve = build(options)
+    local prefix = options.prefix or ""
+    if prefix:sub(-1) == "/" then
+        prefix = prefix:sub(1, -2)
+    end
+    local length = #prefix
+    return function(req)
+        local path = req.path
+        if length > 0 then
+            if path:sub(1, length) ~= prefix then
+                return plain(404, "not found")
+            end
+            path = path:sub(length + 1)
+            if path ~= "" and path:sub(1, 1) ~= "/" then
+                return plain(404, "not found")
+            end
+        end
+        return serve(req.method, path, req.headers, prefix)
+    end
+end
+
+--- Registers the file server on a `web` scope, as in
+--- `app:register(static, { root = "public", prefix = "/assets" })`.
+---
+--- The plugin takes the options of `static.handler`. `web` gives the
+--- plugin a scope of its own under `prefix`, where it adds `GET` and `HEAD`
+--- routes for every path. The hooks of the scope that registers it, such
+--- as logging and CORS, apply to the file responses.
+--- @param scope table The `web` scope.
+--- @param options table The options.
+function M.register(scope, options)
+    local serve = build(options)
+    local mount = scope.prefix
+    if mount:sub(-1) == "/" then
+        mount = mount:sub(1, -2)
+    end
+    local skip = #mount + 1
+    local function route(req)
+        return serve(req.method, req.path:sub(skip), req.headers, mount)
+    end
+    scope:get("/*", route)
+    scope:head("/*", route)
+end
+
+return M

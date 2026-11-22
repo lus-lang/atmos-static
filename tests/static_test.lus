@@ -1,0 +1,457 @@
+local ROOT = string.match(TEST_DIR, "^(.*)[/\\][^/\\]*$")
+local PACKAGES = string.match(ROOT, "^(.*)[/\\][^/\\]*$")
+pledge("load", "fs", "network")
+package.path = ROOT .. "/?.lus;" .. PACKAGES .. "/web/?.lus;" .. PACKAGES .. "/atmos-web/?.lus;" .. package.path
+
+local static = require("static")
+local web = require("web")
+
+local function write(path, content)
+    local file = io.open(path, "wb")
+    file:write(content)
+    file:close()
+end
+
+-- The tree that the tests serve, in the temporary directory of the run.
+fs.createdirectory("public/css", true)
+fs.createdirectory("public/docs", true)
+fs.createdirectory("public/empty", true)
+fs.createdirectory("public/.git", true)
+fs.createdirectory("public/my dir", true)
+fs.createdirectory("outside", true)
+write("public/index.html", "<h1>home</h1>")
+write("public/hello.txt", "hello world")
+write("public/css/site.css", "body { margin: 0 }")
+write("public/docs/index.html", "<h1>docs</h1>")
+write("public/docs/guide.md", "# Guide")
+write("public/app.JS", "console.log(1)")
+write("public/data.bin", "0123456789abcdefghij")
+write("public/noext", "plain")
+write("public/zero.txt", "")
+write("public/.env", "SECRET=1")
+write("public/.git/config", "[core]")
+write("public/my dir/caf\u{e9}.txt", "au lait")
+write("public/%2e%2e", "literal name")
+write("outside/secret.txt", "top secret")
+write("secret.txt", "next to the root")
+fs.createlink("public/link.txt", "../outside/secret.txt")
+fs.createlink("public/linkdir", "../outside")
+do
+    local bytes = vector.create(256)
+    for i = 0, 255 do
+        vector.set(bytes, i, i)
+    end
+    write("public/bytes.bin", bytes)
+end
+
+local handler = static.handler({ root = "public" })
+
+-- Calls a bare handler the way network.serve does.
+local function get(h, path, headers, method)
+    local status, body, out = h({
+        method = method or "GET", path = path, query = "", headers = headers or {}, body = vector.create(0),
+    })
+    if type(body) == "vector" then
+        body = vector.tostring(body, 0, #body, "lossy")
+    end
+    return { status = status, body = body, headers = out or {} }
+end
+
+local function serves_file_test()
+    local res = get(handler, "/hello.txt")
+    assert(res.status == 200 and res.body == "hello world")
+    assert(res.headers["Content-Type"] == "text/plain; charset=utf-8")
+    assert(res.headers["Accept-Ranges"] == "bytes")
+    assert(res.headers["Cache-Control"] == "public, max-age=0")
+    assert(res.headers.ETag:match('^"%x+"$'))
+    assert(res.headers["Last-Modified"]:match("^%a%a%a, %d%d %a%a%a %d%d%d%d %d%d:%d%d:%d%d GMT$"))
+end
+
+local function nested_and_empty_file_test()
+    local res = get(handler, "/css/site.css")
+    assert(res.status == 200 and res.headers["Content-Type"] == "text/css; charset=utf-8")
+    res = get(handler, "/zero.txt")
+    assert(res.status == 200 and res.body == "")
+end
+
+local function content_types_test()
+    assert(get(handler, "/app.JS").headers["Content-Type"] == "text/javascript; charset=utf-8")
+    assert(get(handler, "/data.bin").headers["Content-Type"] == "application/octet-stream")
+    assert(get(handler, "/noext").headers["Content-Type"] == "application/octet-stream")
+    assert(get(handler, "/docs/guide.md").headers["Content-Type"] == "text/markdown; charset=utf-8")
+end
+
+local mime_cases = {
+    { "photo.PNG", "image/png" },
+    { "a/b/c.tar.gz", "application/gzip" },
+    { "woff2", "font/woff2" },
+    { "module.wasm", "application/wasm" },
+    { "movie.mp4", "video/mp4" },
+    { "logo.svg", "image/svg+xml" },
+    { "data.json", "application/json; charset=utf-8" },
+    { "unknown.xyz", "application/octet-stream" },
+    { "dir.d/file", "application/octet-stream" },
+}
+
+local function mime_test(name, want)
+    assert(static.mime(name) == want)
+end
+
+local function not_found_test()
+    assert(get(handler, "/nope.txt").status == 404)
+    assert(get(handler, "/css/nope.css").status == 404)
+    assert(get(handler, "/hello.txt/").status == 404)
+    assert(get(handler, "/hello.txt/more").status == 404)
+end
+
+local function index_test()
+    local res = get(handler, "/")
+    assert(res.status == 200 and res.body == "<h1>home</h1>")
+    assert(res.headers["Content-Type"] == "text/html; charset=utf-8")
+    assert(get(handler, "/docs/").body == "<h1>docs</h1>")
+    assert(get(handler, "/empty/").status == 404)
+end
+
+local function directory_redirect_test()
+    local res = get(handler, "/docs")
+    assert(res.status == 301 and res.headers.Location == "/docs/")
+    res = get(handler, "/my%20dir")
+    assert(res.status == 301 and res.headers.Location == "/my%20dir/")
+    -- Leading slashes collapse, so the redirect stays on this host.
+    res = get(handler, "//docs")
+    assert(res.status == 301 and res.headers.Location == "/docs/")
+end
+
+local function index_options_test()
+    local none = static.handler({ root = "public", index = false })
+    assert(get(none, "/").status == 404)
+    local several = static.handler({ root = "public", index = { "default.htm", "guide.md" } })
+    assert(get(several, "/docs/").body == "# Guide")
+end
+
+local function head_test()
+    local res = get(handler, "/hello.txt", nil, "HEAD")
+    assert(res.status == 200 and res.body == "")
+    assert(res.headers["Content-Length"] == "11")
+    assert(res.headers.ETag == get(handler, "/hello.txt").headers.ETag)
+end
+
+local function method_test()
+    for _, method in ipairs({ "POST", "PUT", "DELETE", "PATCH" }) do
+        local res = get(handler, "/hello.txt", nil, method)
+        assert(res.status == 405 and res.headers.Allow == "GET, HEAD")
+    end
+end
+
+local function etag_test()
+    local first = get(handler, "/hello.txt")
+    local etag = first.headers.ETag
+    local res = get(handler, "/hello.txt", { ["if-none-match"] = etag })
+    assert(res.status == 304 and res.body == "")
+    assert(res.headers.ETag == etag and res.headers["Cache-Control"] ~= nil)
+    assert(get(handler, "/hello.txt", { ["if-none-match"] = `"other", W/$etag` }).status == 304)
+    assert(get(handler, "/hello.txt", { ["if-none-match"] = "*" }).status == 304)
+    assert(get(handler, "/hello.txt", { ["if-none-match"] = '"other"' }).status == 200)
+    assert(etag ~= get(handler, "/css/site.css").headers.ETag)
+end
+
+local function etag_follows_content_test()
+    write("public/changing.txt", "one")
+    local first = get(handler, "/changing.txt")
+    write("public/changing.txt", "two")
+    local res = get(handler, "/changing.txt", { ["if-none-match"] = first.headers.ETag })
+    assert(res.status == 200 and res.body == "two")
+    assert(res.headers.ETag ~= first.headers.ETag)
+end
+
+local function if_modified_since_test()
+    local first = get(handler, "/hello.txt")
+    local modified = first.headers["Last-Modified"]
+    assert(get(handler, "/hello.txt", { ["if-modified-since"] = modified }).status == 304)
+    assert(get(handler, "/hello.txt", { ["if-modified-since"] = "Sun, 06 Nov 1994 08:49:37 GMT" }).status == 200)
+    assert(get(handler, "/hello.txt", { ["if-modified-since"] = "Fri, 01 Jan 2100 00:00:00 GMT" }).status == 304)
+    assert(get(handler, "/hello.txt", { ["if-modified-since"] = "yesterday" }).status == 200)
+    -- If-None-Match takes precedence over the date.
+    local res = get(handler, "/hello.txt", { ["if-none-match"] = '"other"', ["if-modified-since"] = modified })
+    assert(res.status == 200)
+end
+
+local range_cases = {
+    { "bytes=0-4", 206, "01234", "bytes 0-4/20" },
+    { "bytes=5-", 206, "56789abcdefghij", "bytes 5-19/20" },
+    { "bytes=-3", 206, "hij", "bytes 17-19/20" },
+    { "bytes=19-19", 206, "j", "bytes 19-19/20" },
+    { "bytes=10-999", 206, "abcdefghij", "bytes 10-19/20" },
+    { "bytes=-999", 206, "0123456789abcdefghij", "bytes 0-19/20" },
+    { "bytes=0-0", 206, "0", "bytes 0-0/20" },
+}
+
+local function range_test(range, status, body, content_range)
+    local res = get(handler, "/data.bin", { range = range })
+    assert(res.status == status)
+    assert(res.body == body)
+    assert(res.headers["Content-Range"] == content_range)
+end
+
+local function range_unsatisfiable_test()
+    for _, range in ipairs({ "bytes=20-", "bytes=100-200", "bytes=-0" }) do
+        local res = get(handler, "/data.bin", { range = range })
+        assert(res.status == 416)
+        assert(res.headers["Content-Range"] == "bytes */20")
+    end
+    assert(get(handler, "/zero.txt", { range = "bytes=-5" }).status == 416)
+end
+
+local function range_ignored_test()
+    for _, range in ipairs({ "bytes=0-1,5-6", "items=0-4", "bytes=5-2", "bytes=abc", "bytes=-", "bytes" }) do
+        local res = get(handler, "/data.bin", { range = range })
+        assert(res.status == 200 and #res.body == 20)
+        assert(res.headers["Content-Range"] == nil)
+    end
+end
+
+local function if_range_test()
+    local first = get(handler, "/data.bin")
+    local res = get(handler, "/data.bin", { range = "bytes=0-1", ["if-range"] = first.headers.ETag })
+    assert(res.status == 206 and res.body == "01")
+    res = get(handler, "/data.bin", { range = "bytes=0-1", ["if-range"] = first.headers["Last-Modified"] })
+    assert(res.status == 206)
+    res = get(handler, "/data.bin", { range = "bytes=0-1", ["if-range"] = '"stale"' })
+    assert(res.status == 200 and #res.body == 20)
+end
+
+local function head_range_test()
+    local res = get(handler, "/data.bin", { range = "bytes=0-4" }, "HEAD")
+    assert(res.status == 206 and res.body == "" and res.headers["Content-Length"] == "5")
+end
+
+local function cache_control_test()
+    local h = static.handler({ root = "public", max_age = 31536000, immutable = true })
+    assert(get(h, "/hello.txt").headers["Cache-Control"] == "public, max-age=31536000, immutable")
+    h = static.handler({ root = "public", max_age = 3600.9 })
+    assert(get(h, "/hello.txt").headers["Cache-Control"] == "public, max-age=3600")
+    h = static.handler({ root = "public", max_age = false, headers = { ["X-Content-Type-Options"] = "nosniff" } })
+    local res = get(h, "/hello.txt")
+    assert(res.headers["Cache-Control"] == nil)
+    assert(res.headers["X-Content-Type-Options"] == "nosniff")
+end
+
+-- Security -------------------------------------------------------------------------
+
+local traversal_cases = {
+    "/../secret.txt",
+    "/../outside/secret.txt",
+    "/css/../../secret.txt",
+    "/%2e%2e/secret.txt",
+    "/%2E%2E/secret.txt",
+    "/.%2e/secret.txt",
+    "/%2e./secret.txt",
+    "/css/%2e%2e/%2e%2e/secret.txt",
+    "/..%2fsecret.txt",
+    "/..%2Fsecret.txt",
+    "/%2e%2e%2fsecret.txt",
+    "/..\\secret.txt",
+    "/..%5csecret.txt",
+    "/css\\..\\..\\secret.txt",
+    "/%5c..%5csecret.txt",
+    "/..",
+    "/../",
+    "/css/..",
+    "/hello.txt/..",
+}
+
+local function traversal_test(case)
+    local res = get(handler, case)
+    assert(res.status == 403)
+    assert(res.body:find("secret", 1, true) == nil)
+end
+
+local function double_encoding_test()
+    -- One round of decoding turns %252e%252e into the literal name %2e%2e.
+    local res = get(handler, "/%252e%252e")
+    assert(res.status == 200 and res.body == "literal name")
+    assert(get(handler, "/%252e%252e/secret.txt").status == 404)
+    assert(get(handler, "/%252e%252e%252fsecret.txt").status == 404)
+end
+
+local malformed_cases = { "/%", "/%2", "/%zz", "/a%0", "/hello.txt%00", "/%00", "/%ff%fe", "/%c3", "/%ed%a0%80%ed%b0%80x%ff" }
+
+local function malformed_test(case)
+    assert(get(handler, case).status == 400)
+end
+
+local function absolute_and_odd_paths_test()
+    assert(get(handler, "//etc/passwd").status == 404)
+    assert(get(handler, "/./hello.txt").body == "hello world")
+    assert(get(handler, "//hello.txt").body == "hello world")
+    assert(get(handler, "/css//site.css").status == 200)
+    assert(get(handler, "/%68ello.txt").body == "hello world")
+end
+
+local function unicode_path_test()
+    assert(get(handler, "/my%20dir/caf%C3%A9.txt").body == "au lait")
+    assert(get(handler, "/my dir/caf\u{e9}.txt").body == "au lait")
+end
+
+local function dotfiles_test()
+    for _, path in ipairs({ "/.env", "/.git/config", "/.git/", "/%2eenv", "/css/.hidden" }) do
+        assert(get(handler, path).status == 404)
+    end
+    local deny = static.handler({ root = "public", dotfiles = "deny" })
+    assert(get(deny, "/.env").status == 403)
+    assert(get(deny, "/.git/config").status == 403)
+    local allow = static.handler({ root = "public", dotfiles = "allow" })
+    assert(get(allow, "/.env").body == "SECRET=1")
+    -- Allowed dotfiles still cannot leave the root.
+    assert(get(allow, "/../secret.txt").status == 403)
+end
+
+local function symlink_test()
+    assert(get(handler, "/link.txt").status == 404)
+    assert(get(handler, "/linkdir/secret.txt").status == 404)
+    assert(get(handler, "/linkdir/").status == 404)
+    local following = static.handler({ root = "public", links = true })
+    assert(get(following, "/link.txt").body == "top secret")
+    assert(get(following, "/linkdir/secret.txt").body == "top secret")
+end
+
+local function invalid_options_test()
+    raises(function() static.handler({}) end, "root option")
+    raises(function() static.handler({ root = "missing-directory" }) end, "is not a directory")
+    raises(function() static.handler({ root = "public/hello.txt" }) end, "is not a directory")
+    raises(function() static.handler({ root = "public", dotfiles = "show" }) end, "dotfiles must be")
+end
+
+-- Prefix, fallback, and cache ------------------------------------------------------
+
+local function prefix_test()
+    local h = static.handler({ root = "public", prefix = "/assets" })
+    assert(get(h, "/assets/hello.txt").body == "hello world")
+    assert(get(h, "/assets/").body == "<h1>home</h1>")
+    assert(get(h, "/assets").headers.Location == "/assets/")
+    assert(get(h, "/assets/docs").headers.Location == "/assets/docs/")
+    assert(get(h, "/hello.txt").status == 404)
+    assert(get(h, "/assetsfoo/hello.txt").status == 404)
+    assert(get(h, "/assets/../secret.txt").status == 403)
+end
+
+local function fallback_test()
+    local h = static.handler({ root = "public", fallback = "index.html" })
+    local res = get(h, "/some/client/route")
+    assert(res.status == 200 and res.body == "<h1>home</h1>")
+    assert(get(h, "/hello.txt").body == "hello world")
+    assert(get(h, "/../secret.txt").status == 403)
+end
+
+local function cache_test()
+    write("public/cached.txt", "first")
+    local h = static.handler({ root = "public", cache = true })
+    assert(get(h, "/cached.txt").body == "first")
+    write("public/cached.txt", "second")
+    assert(get(h, "/cached.txt").body == "first")
+    assert(get(handler, "/cached.txt").body == "second")
+    -- A file over the limit is read on every request.
+    local small = static.handler({ root = "public", cache = true, cache_limit = 3 })
+    assert(get(small, "/cached.txt").body == "second")
+    write("public/cached.txt", "third")
+    assert(get(small, "/cached.txt").body == "third")
+end
+
+-- The web plugin ---------------------------------------------------------------------
+
+local function web_plugin_test()
+    local app = web.app()
+    app:get("/api/ping", function() return { pong = true } end)
+    app:register(static, { root = "public", prefix = "/assets", max_age = 60 })
+    local res = app:inject({ path = "/assets/hello.txt" })
+    assert(res.status == 200 and res.body == "hello world")
+    assert(res.headers["content-type"] == "text/plain; charset=utf-8")
+    assert(res.headers["cache-control"] == "public, max-age=60")
+    assert(app:inject({ path = "/assets/css/site.css?v=3" }).status == 200)
+    assert(app:inject({ path = "/assets/" }).body == "<h1>home</h1>")
+    assert(app:inject({ path = "/assets" }).headers.location == "/assets/")
+    assert(app:inject({ path = "/assets/nope" }).status == 404)
+    assert(app:inject({ path = "/api/ping" }):json().pong == true)
+    assert(app:inject({ path = "/hello.txt" }).status == 404)
+end
+
+local function web_conditional_and_range_test()
+    local app = web.app()
+    app:register(static, { root = "public" })
+    local first = app:inject({ path = "/data.bin" })
+    assert(app:inject({ path = "/data.bin", headers = { ["If-None-Match"] = first.headers.etag } }).status == 304)
+    local res = app:inject({ path = "/data.bin", headers = { Range = "bytes=2-5" } })
+    assert(res.status == 206 and res.body == "2345" and res.headers["content-range"] == "bytes 2-5/20")
+    res = app:inject({ method = "HEAD", path = "/data.bin" })
+    assert(res.status == 200 and res.body == "" and res.headers["content-length"] == "20")
+    assert(app:inject({ method = "POST", path = "/data.bin" }).status == 405)
+end
+
+local function web_binary_range_test()
+    local app = web.app()
+    app:register(static, { root = "public" })
+    local res = app:inject({ path = "/bytes.bin", headers = { Range = "bytes=250-" } })
+    local body = res:bytes()
+    assert(res.status == 206 and #body == 6)
+    assert(vector.get(body, 0) == 250 and vector.get(body, 5) == 255)
+    assert(res.headers["content-range"] == "bytes 250-255/256")
+    body = app:inject({ path = "/bytes.bin" }):bytes()
+    assert(#body == 256 and vector.get(body, 128) == 128)
+end
+
+local function web_security_test()
+    local app = web.app()
+    app:register(static, { root = "public", prefix = "/files" })
+    for _, path in ipairs({ "/files/../secret.txt", "/files/%2e%2e/secret.txt", "/files/..%5csecret.txt", "/files/..%2f..%2fsecret.txt" }) do
+        local res = app:inject({ path = path })
+        assert(res.status == 403)
+    end
+    assert(app:inject({ path = "/files/.env" }).status == 404)
+    assert(app:inject({ path = "/files/link.txt" }).status == 404)
+    assert(app:inject({ path = "/files/%zz" }).status == 400)
+end
+
+local function web_scope_prefix_and_hooks_test()
+    local app = web.app()
+    local seen = {}
+    app:register(function(scope)
+        scope:hook("on_response", function(req, status) seen[#seen + 1] = `$(req.path) $status` end)
+        scope:register(static, { root = "public", prefix = "/static" })
+    end, { prefix = "/site" })
+    assert(app:inject({ path = "/site/static/hello.txt" }).body == "hello world")
+    assert(app:inject({ path = "/site/static/docs" }).headers.location == "/site/static/docs/")
+    assert(seen[1] == "/site/static/hello.txt 200")
+end
+
+-- A real server ------------------------------------------------------------------------
+
+local function network_serve_test()
+    local ok, server = catch network.tcp.bind("127.0.0.1", 0)
+    if not ok then
+        skip("cannot bind a local port here")
+    end
+    local _, port = server:getsockname()
+    local serving = coroutine.detach(coroutine.create(network.serve), server, handler)
+    local function request(text)
+        local sock <close> = network.tcp.connect("127.0.0.1", port)
+        sock:send(text .. "Host: localhost\r\nConnection: close\r\n\r\n")
+        return vector.tostring(sock:receive("*a"), 0, nil, "lossy")
+    end
+    local response = request("GET /hello.txt HTTP/1.1\r\n")
+    assert(response:find("^HTTP/1.1 200"))
+    assert(response:find("Content-Length: 11\r\n", 1, true))
+    assert(response:match("\r\n\r\n(.*)$") == "hello world")
+    response = request("HEAD /hello.txt HTTP/1.1\r\n")
+    assert(response:find("^HTTP/1.1 200"))
+    assert(response:find("Content-Length: 11\r\n", 1, true))
+    assert(response:match("\r\n\r\n(.*)$") == "")
+    response = request("GET /data.bin HTTP/1.1\r\nRange: bytes=-4\r\n")
+    assert(response:find("^HTTP/1.1 206"))
+    assert(response:match("\r\n\r\n(.*)$") == "ghij")
+    response = request("GET /../secret.txt HTTP/1.1\r\n")
+    assert(response:find("^HTTP/1.1 403"))
+    response = request("GET /%2e%2e/%2e%2e/secret.txt HTTP/1.1\r\n")
+    assert(response:find("^HTTP/1.1 403"))
+    coroutine.close(serving)
+    server:close()
+end
