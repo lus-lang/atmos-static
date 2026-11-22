@@ -9,18 +9,17 @@
 --- would leave the root is refused, in its plain and its percent-encoded
 --- forms. Files whose names start with a dot are hidden by default.
 ---
---- The `ETag` is a hash of the content of the file. `Last-Modified` is the
---- time at which the handler first read that content, because the standard
---- library reports no modification time. Both validators change when the
---- content changes.
+--- Both validators come from `fs.stat`, so the handler computes them
+--- without reading the file. `Last-Modified` is the modification time of the
+--- file. The `ETag` has the form `"SIZE-TIME"`, which holds the size in
+--- bytes and the modification time in nanoseconds, both in hexadecimal. A
+--- change to the file that keeps its size and its modification time keeps
+--- the `ETag`.
 ---
 --- A file larger than the `stream_threshold` option, 256 KiB by default,
 --- is streamed from the disk in parts of 64 KiB, so its response takes
---- the same memory whatever the size of the file. The handler reads no
---- more of such a file than the response sends, so the response carries no
---- `ETag` and no `Last-Modified`. With the `cache` option, the handler
---- hashes the file once, in parts, so every response carries both
---- validators.
+--- the same memory whatever the size of the file. A streamed response
+--- carries the same validators as any other.
 ---
 --- @package static
 --- @version 1.0.0
@@ -235,7 +234,8 @@ local function plain(status, text, extra)
     return status, text, headers
 end
 
--- Tells whether an If-None-Match or If-Match style list names `etag`.
+-- Tells whether an If-None-Match list names the quoted tag `etag`. The
+-- comparison is weak, so a `W/` before either tag is ignored.
 local function etag_listed(list, etag)
     if list:find("*", 1, true) and list:match("^%s*%*%s*$") then
         return true
@@ -311,20 +311,6 @@ local function stream(file, start, length)
     end)
 end
 
--- Returns the quoted ETag of the open file `file`, hashed in parts.
-local function hash_file(file)
-    local hasher = crypto.hasher("sha256")
-    file:seek("set", 0)
-    while true do
-        local part = file:read(PART)
-        if part == nil then
-            break
-        end
-        hasher:update(part)
-    end
-    return `"$(string.transcode(hasher:digest(), "binary", "hex"):sub(1, 32))"`
-end
-
 -- The server ----------------------------------------------------------------------------------
 
 local function build(options)
@@ -370,8 +356,6 @@ local function build(options)
     end
     local cache_limit = options.cache_limit or 64 * 1024 * 1024
     local cached, cached_bytes = {}, 0
-    -- The ETag and the time of the content last seen at each path.
-    local seen = {}
 
     -- Returns the kind of the entry below the root, or nil when it is
     -- absent or reached through a symbolic link that the options refuse.
@@ -398,55 +382,49 @@ local function build(options)
         return types[(path:match("%.([^./]+)$") or ""):lower()] or OCTET
     end
 
+    -- Returns the size, the validators, and the content type of the file
+    -- at `path`, with its content when the file is small enough to send
+    -- whole. Returns nil when the file cannot be read.
     local function load(path)
         if entry = cached[path] then
+            return entry
+        end
+        local found, info = catch fs.stat(path)
+        if not found or info.kind ~= "file" then
+            return nil
+        end
+        local size = info.size
+        local modified = info.modified
+        local seconds = modified:epoch()
+        local etag = string.format('"%x-%x"', size, seconds * 1000000000 + modified:nanos())
+        local entry = {
+            size = size,
+            path = path,
+            etag = etag,
+            modified = seconds,
+            date = http_date(seconds),
+            mime = mime_of(path),
+        }
+        if size > stream_threshold then
+            -- The response streams a large file from the disk, so the cache
+            -- keeps its size and its validators only.
+            if caching then
+                cached[path] = entry
+            end
             return entry
         end
         local file = io.open(path, "rb")
         if file == nil then
             return nil
         end
-        local sized, size = catch file:seek("end")
-        if sized and size > stream_threshold then
-            -- A large file keeps its handle for the stream of the response.
-            local entry = { size = size, path = path, file = file, mime = mime_of(path) }
-            if caching then
-                local hashed, etag = catch hash_file(file)
-                if not hashed then
-                    file:close()
-                    return nil
-                end
-                local at = os.time()
-                entry.etag, entry.modified, entry.date = etag, at, http_date(at)
-                -- The cache keeps the size and the validators of the file,
-                -- and each response opens the file again.
-                cached[path] = { size = size, path = path, mime = entry.mime, etag = etag, modified = at, date = entry.date }
-            end
-            return entry
-        end
-        if sized then
-            file:seek("set", 0)
-        end
         local read_ok, body = catch file:read("a")
         file:close()
-        if not read_ok or body == nil then
+        if not read_ok then
             return nil
         end
-        local etag = `"$(string.transcode(crypto.hash("sha256", body), "binary", "hex"):sub(1, 32))"`
-        local memo = seen[path]
-        if memo == nil or memo.etag ~= etag then
-            local at = os.time()
-            memo = { etag = etag, modified = at, date = http_date(at) }
-            seen[path] = memo
-        end
-        local entry = {
-            body = body,
-            size = #body,
-            etag = etag,
-            modified = memo.modified,
-            date = memo.date,
-            mime = mime_of(path),
-        }
+        body = body or ""
+        entry.body = body
+        entry.size = #body
         if caching and cached_bytes + entry.size <= cache_limit then
             cached[path] = entry
             cached_bytes = cached_bytes + entry.size
@@ -470,27 +448,17 @@ local function build(options)
         return headers
     end
 
-    -- Closes the handle of a large file whose response sends no part of it.
-    local function release(entry)
-        if file = entry.file then
-            entry.file = nil
-            file:close()
-        end
-    end
-
     local function send(entry, method, request)
         local headers = base_headers(entry)
         if none_match = request["if-none-match"] then
-            if entry.etag and etag_listed(none_match, entry.etag) then
+            if etag_listed(none_match, entry.etag) then
                 headers["Content-Type"] = nil
-                release(entry)
                 return 304, "", headers
             end
         elseif since_text = request["if-modified-since"] then
             local since = parse_http_date(since_text)
-            if since and entry.modified and entry.modified <= since then
+            if since and entry.modified <= since then
                 headers["Content-Type"] = nil
-                release(entry)
                 return 304, "", headers
             end
         end
@@ -498,14 +466,14 @@ local function build(options)
         local status, body = 200, entry.body
         local first, last = 0, size - 1
         if range = request.range then
+            -- An If-Range compares strongly, so a tag with `W/` differs.
             local condition = request["if-range"]
             if condition == nil or condition == entry.etag or condition == entry.date then
                 local start, stop = parse_range(range, size)
                 if start == false then
                     headers["Content-Range"] = `bytes */$(size)`
                     headers["Content-Type"] = TEXT
-                    release(entry)
-                    return 416, "range not satisfiable", headers
+                        return 416, "range not satisfiable", headers
                 elseif start ~= nil then
                     status = 206
                     headers["Content-Range"] = `bytes $(start)-$(stop)/$(size)`
@@ -519,17 +487,15 @@ local function build(options)
         local length = last - first + 1
         if method == "HEAD" then
             headers["Content-Length"] = tostring(length)
-            release(entry)
             return status, "", headers
         end
         if body == nil then
             -- A large file goes out as a stream of its parts. The length
             -- is known, so the response declares it.
-            local file = entry.file or io.open(entry.path, "rb")
+            local file = io.open(entry.path, "rb")
             if file == nil then
                 return plain(404, "not found")
             end
-            entry.file = nil
             headers["Content-Length"] = tostring(length)
             body = stream(file, first, length)
         end
@@ -620,11 +586,10 @@ end
 --- - `stream_threshold`: the size in bytes over which a file is streamed,
 ---   256 KiB by default. The body of the response is then a coroutine that
 ---   yields the file in parts of 64 KiB and closes the file at its end or
----   when it is closed. The response declares its `Content-Length`. It
----   carries an `ETag` and `Last-Modified` only with `cache`, which keeps
----   the size and the validators of a streamed file in memory and leaves
----   its content on the disk. A whole file and a byte range are both
----   streamed.
+---   when it is closed. The response declares its `Content-Length`. A
+---   whole file and a byte range are both streamed. With `cache`, the
+---   handler keeps the size and the validators of a streamed file in
+---   memory and leaves its content on the disk.
 ---
 --- The handler answers `GET` and `HEAD` and refuses other methods with
 --- 405. A path with a `..` segment or a backslash answers 403, whether
@@ -632,7 +597,9 @@ end
 --- malformed escape, a NUL, or invalid UTF-8 answers 400. A `Range`
 --- header with one range gets a 206 response, or 416 when the range
 --- starts past the end of the file. A header with several ranges gets
---- the whole file.
+--- the whole file. So does a range whose `If-Range` equals neither the
+--- `ETag` nor the `Last-Modified` of the file, which lets a client resume
+--- a download only while the file is unchanged.
 ---
 --- A missing `root`, a `root` that is not a directory, an unknown
 --- `dotfiles` value, and a `stream_threshold` that is not a non-negative

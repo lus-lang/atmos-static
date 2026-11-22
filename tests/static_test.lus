@@ -63,8 +63,21 @@ local function serves_file_test()
     assert(res.headers["Content-Type"] == "text/plain; charset=utf-8")
     assert(res.headers["Accept-Ranges"] == "bytes")
     assert(res.headers["Cache-Control"] == "public, max-age=0")
-    assert(res.headers.ETag:match('^"%x+"$'))
+    assert(res.headers.ETag:match('^"%x+%-%x+"$'))
     assert(res.headers["Last-Modified"]:match("^%a%a%a, %d%d %a%a%a %d%d%d%d %d%d:%d%d:%d%d GMT$"))
+end
+
+-- The validators hold the size and the modification time that fs.stat
+-- reports.
+local function validators_from_stat_test()
+    local info = fs.stat("public/hello.txt")
+    local res = get(handler, "/hello.txt")
+    local nanos = info.modified:epoch() * 1000000000 + info.modified:nanos()
+    assert(res.headers.ETag == string.format('"%x-%x"', 11, nanos), res.headers.ETag)
+    local d, mon, y, h, mi, sec = res.headers["Last-Modified"]:match("^%a+, (%d+) (%a+) (%d+) (%d+):(%d+):(%d+) GMT$")
+    local months = { Jan = 1, Feb = 2, Mar = 3, Apr = 4, May = 5, Jun = 6, Jul = 7, Aug = 8, Sep = 9, Oct = 10, Nov = 11, Dec = 12 }
+    local parsed = time.parse(string.format("%s-%02d-%sT%s:%s:%sZ", y, months[mon], d, h, mi, sec))
+    assert(parsed:epoch() == info.modified:epoch())
 end
 
 local function nested_and_empty_file_test()
@@ -149,19 +162,25 @@ local function etag_test()
     local res = get(handler, "/hello.txt", { ["if-none-match"] = etag })
     assert(res.status == 304 and res.body == "")
     assert(res.headers.ETag == etag and res.headers["Cache-Control"] ~= nil)
-    assert(get(handler, "/hello.txt", { ["if-none-match"] = `"other", W/$etag` }).status == 304)
+    -- The comparison is weak, so the tag matches with and without `W/`.
+    assert(get(handler, "/hello.txt", { ["if-none-match"] = `"other", $etag` }).status == 304)
+    assert(get(handler, "/hello.txt", { ["if-none-match"] = `W/$etag` }).status == 304)
     assert(get(handler, "/hello.txt", { ["if-none-match"] = "*" }).status == 304)
     assert(get(handler, "/hello.txt", { ["if-none-match"] = '"other"' }).status == 200)
     assert(etag ~= get(handler, "/css/site.css").headers.ETag)
 end
 
-local function etag_follows_content_test()
+local function etag_follows_file_test()
     write("public/changing.txt", "one")
     local first = get(handler, "/changing.txt")
-    write("public/changing.txt", "two")
+    write("public/changing.txt", "three")
     local res = get(handler, "/changing.txt", { ["if-none-match"] = first.headers.ETag })
-    assert(res.status == 200 and res.body == "two")
+    assert(res.status == 200 and res.body == "three")
     assert(res.headers.ETag ~= first.headers.ETag)
+    -- Two handlers compute the same validators for the same file.
+    local other = static.handler({ root = "public" })
+    assert(get(other, "/changing.txt").headers.ETag == res.headers.ETag)
+    assert(get(other, "/changing.txt").headers["Last-Modified"] == res.headers["Last-Modified"])
 end
 
 local function if_modified_since_test()
@@ -212,10 +231,15 @@ end
 
 local function if_range_test()
     local first = get(handler, "/data.bin")
-    local res = get(handler, "/data.bin", { range = "bytes=0-1", ["if-range"] = first.headers.ETag })
+    local res = get(handler, "/data.bin", { range = "bytes=0-1", ["if-range"] = first.headers["Last-Modified"] })
     assert(res.status == 206 and res.body == "01")
-    res = get(handler, "/data.bin", { range = "bytes=0-1", ["if-range"] = first.headers["Last-Modified"] })
-    assert(res.status == 206)
+    res = get(handler, "/data.bin", { range = "bytes=0-1", ["if-range"] = first.headers.ETag })
+    assert(res.status == 206 and res.body == "01")
+    -- An If-Range compares strongly, so the same tag with `W/` differs.
+    res = get(handler, "/data.bin", { range = "bytes=0-1", ["if-range"] = `W/$(first.headers.ETag)` })
+    assert(res.status == 200 and #res.body == 20)
+    res = get(handler, "/data.bin", { range = "bytes=0-1", ["if-range"] = "Sun, 06 Nov 1994 08:49:37 GMT" })
+    assert(res.status == 200 and #res.body == 20)
     res = get(handler, "/data.bin", { range = "bytes=0-1", ["if-range"] = '"stale"' })
     assert(res.status == 200 and #res.body == 20)
 end
@@ -426,8 +450,8 @@ end
 -- A real server ------------------------------------------------------------------------
 
 local function network_serve_test()
-    local ok, server = catch network.tcp.bind("127.0.0.1", 0)
-    if not ok then
+    local server = network.tcp.bind("127.0.0.1", 0)
+    if not server then
         skip("cannot bind a local port here")
     end
     local _, port = server:getsockname()
@@ -491,8 +515,10 @@ local function streams_large_file_test()
     assert(status == 200 and headers["Content-Length"] == tostring(LARGE_SIZE))
     assert(headers["Content-Type"] == "application/octet-stream")
     assert(headers["Accept-Ranges"] == "bytes")
-    -- A streamed file has no validators without the cache.
-    assert(headers.ETag == nil and headers["Last-Modified"] == nil)
+    -- A streamed file has its validators without the cache.
+    local info = fs.stat("public/large.bin")
+    assert(headers.ETag == string.format('"%x-%x"', LARGE_SIZE, info.modified:epoch() * 1000000000 + info.modified:nanos()))
+    assert(headers["Last-Modified"] ~= nil)
     local parts = parts_of(body)
     assert(#parts == 5 and #parts[1] == 65536 and #parts[5] == LARGE_SIZE - 4 * 65536)
     assert(vector.get(parts[1], 7) == 7 and vector.get(parts[1], 300) == 49)
@@ -560,42 +586,56 @@ local function stream_closes_its_file_test()
     fs.remove("public/closing.txt")
 end
 
-local function stream_validators_with_cache_test()
+local function stream_validators_test()
     write("public/movie.bin", string.rep("frame", 10))
-    local h = static.handler({ root = "public", cache = true, stream_threshold = 4 })
+    local h = static.handler({ root = "public", stream_threshold = 4 })
     local status, body, headers = h({ method = "GET", path = "/movie.bin", headers = {} })
     local etag = headers.ETag
-    assert(status == 200 and etag:match('^"%x+"$') and headers["Last-Modified"])
+    assert(status == 200 and etag:match('^"32%-%x+"$') and headers["Last-Modified"])
     assert(vector.tostring(parts_of(body)[1]) == string.rep("frame", 10))
-    -- The ETag of a streamed file is the ETag of the same bytes read whole.
+    -- A streamed file and the same file read whole have the same validators.
     local whole = static.handler({ root = "public" })
     local _, _, whole_headers = whole({ method = "GET", path = "/movie.bin", headers = {} })
-    assert(whole_headers.ETag == etag)
+    assert(whole_headers.ETag == etag and whole_headers["Last-Modified"] == headers["Last-Modified"])
     status, body = h({ method = "GET", path = "/movie.bin", headers = { ["if-none-match"] = etag } })
     assert(status == 304 and body == "")
+    status, body = h({ method = "GET", path = "/movie.bin", headers = { ["if-none-match"] = "*" } })
+    assert(status == 304 and body == "")
+    status, body = h({ method = "GET", path = "/movie.bin", headers = { ["if-none-match"] = '"x"' } })
+    assert(status == 200)
+    coroutine.close(body)
     status = h({ method = "GET", path = "/movie.bin", headers = { ["if-modified-since"] = headers["Last-Modified"] } })
     assert(status == 304)
+    status = h({ method = "GET", path = "/movie.bin", headers = { ["if-modified-since"] = "Sun, 06 Nov 2094 08:49:37 GMT" } })
+    assert(status == 304)
+    status, body = h({ method = "GET", path = "/movie.bin", headers = { ["if-modified-since"] = "Sun, 06 Nov 1994 08:49:37 GMT" } })
+    assert(status == 200)
+    coroutine.close(body)
+    status, body = h({ method = "GET", path = "/movie.bin", headers = { range = "bytes=0-4", ["if-range"] = headers["Last-Modified"] } })
+    assert(status == 206 and vector.tostring(parts_of(body)[1]) == "frame")
     status, body = h({ method = "GET", path = "/movie.bin", headers = { range = "bytes=0-4", ["if-range"] = etag } })
     assert(status == 206 and vector.tostring(parts_of(body)[1]) == "frame")
     status, body = h({ method = "GET", path = "/movie.bin", headers = { range = "bytes=0-4", ["if-range"] = '"other"' } })
     assert(status == 200 and #parts_of(body)[1] == 50)
+    -- The validators follow the file.
+    write("public/movie.bin", string.rep("frame", 11))
+    status, body, headers = h({ method = "GET", path = "/movie.bin", headers = { ["if-none-match"] = etag } })
+    assert(status == 200 and headers.ETag ~= etag and headers["Content-Length"] == "55")
+    coroutine.close(body)
+    fs.remove("public/movie.bin")
+end
+
+local function stream_cache_test()
+    write("public/movie.bin", string.rep("frame", 10))
+    local h = static.handler({ root = "public", cache = true, stream_threshold = 4 })
+    local status, body, headers = h({ method = "GET", path = "/movie.bin", headers = {} })
+    assert(status == 200 and headers.ETag ~= nil)
+    coroutine.close(body)
     -- The cache keeps the validators, and the content comes from the disk.
     fs.remove("public/movie.bin")
     assert(h({ method = "GET", path = "/movie.bin", headers = {} }) == 404)
-    assert(h({ method = "HEAD", path = "/movie.bin", headers = {} }) == 200)
-end
-
-local function stream_without_validators_test()
-    local h = static.handler({ root = "public", stream_threshold = 4 })
-    local status, body = h({ method = "GET", path = "/data.bin", headers = { ["if-none-match"] = "*" } })
-    assert(status == 200)
-    coroutine.close(body)
-    status, body = h({ method = "GET", path = "/data.bin", headers = { ["if-modified-since"] = "Sun, 06 Nov 2094 08:49:37 GMT" } })
-    assert(status == 200)
-    coroutine.close(body)
-    -- An If-Range has no validator to match, so the whole file goes out.
-    status, body = h({ method = "GET", path = "/data.bin", headers = { range = "bytes=0-1", ["if-range"] = '"x"' } })
-    assert(status == 200 and #parts_of(body)[1] == 20)
+    local head_status, _, head_headers = h({ method = "HEAD", path = "/movie.bin", headers = {} })
+    assert(head_status == 200 and head_headers.ETag == headers.ETag)
 end
 
 local function stream_security_test()
@@ -635,8 +675,8 @@ local function web_stream_test()
 end
 
 local function network_serve_stream_test()
-    local ok, server = catch network.tcp.bind("127.0.0.1", 0)
-    if not ok then
+    local server = network.tcp.bind("127.0.0.1", 0)
+    if not server then
         skip("cannot bind a local port here")
     end
     local _, port = server:getsockname()
