@@ -1,19 +1,21 @@
 # AGENTS.md
 
-This repository, `lus-lang/atmos-static`, is the `static` package of the atmosphere registry. Programs load it with `require("https://atmosp.here/2.0/static.lus")`.
+`lus-lang/atmos-static` is the repository of the `static` package of the atmosphere registry. Programs load the package with `require("https://atmosp.here/2.0/static.lus")`.
 
 ## Scope
 
-Serves the files of a directory with content types, `ETag` and `Last-Modified` validators, `Range` requests, `Cache-Control`, and index files. It refuses paths that leave the root. It works as a `web` plugin and as a bare `network.serve` handler. The public API is every function that `static.lus` returns in its module table. A change to that API needs a new entry in `CHANGELOG.md` and a version change in the header.
+`static` serves the files of a directory over HTTP with content types, `ETag` and `Last-Modified` validators, `Range` requests, `Cache-Control`, and index files, refusing any path that leaves the root. It works as a `web` plugin and as a handler for `network.serve`. The public API is every function that `static.lus` returns in its module table. A change to that API needs a new entry in `CHANGELOG.md` and a version change in the header.
 
 ## Layout
 
-- `static.lus` is the whole package. Its header doc comment carries the package metadata and the declared permissions.
-- `tests/*_test.lus` are the tests. They load the package from the parent directory through `TEST_DIR`.
+- `static.lus` is the whole package. Its header doc comment contains the package metadata and the declared permissions.
+- `tests/*_test.lus` are the tests. They load `static.lus` from the parent of `TEST_DIR`, the directory that holds the test file.
 
 The tests load `web` from a checkout of `lus-lang/atmos-web` next to this repository, so clone it into the same parent directory first.
 
 ## Commands
+
+Run these commands from the root of the repository.
 
 ```sh
 lus test tests          # run the tests
@@ -25,5 +27,5 @@ lus doc static.lus       # print the reference
 
 - Every public function has a doc comment that states each result and each error, following `spec/design/style.md` of the Lus repository.
 - The package never calls `pledge`. A new permission is declared in the header and in the README.
-- Prose has no dashes and no semicolons, and never names the Roblox Lua dialect.
+- Prose follows the `lus-writing` skill, which `lus agents init` installs and https://lus.dev/agents/skills/lus-writing/SKILL.md serves. In particular, prose has no dashes or semicolons and never names the Roblox Lua dialect.
 - Every bug fix comes with a test that fails without it.

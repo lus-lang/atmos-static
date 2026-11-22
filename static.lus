@@ -1,22 +1,21 @@
 --- Serves the files of a directory over HTTP.
 ---
 --- `static.handler` returns a handler for `network.serve`. Registered on a
---- `web` scope, the package serves the directory under a prefix of the
---- scope. A response carries a `Content-Type` from a table of file
---- extensions, an `ETag`, `Last-Modified`, `Accept-Ranges`, and
---- `Cache-Control`. Requests with `If-None-Match` or `If-Modified-Since`
---- are answered with 304, and a request for one byte range with 206. A
---- path that would leave the root is refused, in its plain and its
---- percent-encoded forms. Files whose names start with a dot are hidden by
---- default.
+--- `web` scope, the package serves the directory under a prefix of the scope.
+--- A response carries a `Content-Type` from a table of file extensions, an
+--- `ETag`, `Last-Modified`, `Accept-Ranges`, and `Cache-Control`. A request
+--- whose `If-None-Match` or `If-Modified-Since` matches the file is answered
+--- with 304. A request for one byte range is answered with 206. A path that
+--- would leave the root is refused, in its plain and its percent-encoded
+--- forms. Files whose names start with a dot are hidden by default.
 ---
 --- The `ETag` is a hash of the content of the file. `Last-Modified` is the
---- time at which the handler first saw that content, because the standard
+--- time at which the handler first read that content, because the standard
 --- library reports no modification time. Both validators change when the
 --- content changes.
 ---
 --- @package static
---- @version 0.1.0
+--- @version 1.0.0
 --- @lus 2.0
 --- @license 0BSD
 --- @repository https://github.com/lus-lang/atmos-static
@@ -81,7 +80,7 @@ local OCTET = "application/octet-stream"
 ---
 --- The extension is the text after the last dot, compared without regard
 --- to case. A name with an extension outside `static.types`, or with no
---- extension, gives `application/octet-stream`.
+--- extension, returns `application/octet-stream`.
 --- @param name string The file name, path, or extension.
 --- @return string The content type.
 function M.mime(name)
@@ -327,13 +326,13 @@ local function build(options)
         local path = root
         local entry_ok, entry, link
         if follow_links then
-            path = count > 0 and (root .. "/" .. concat(segments, "/", 1, count)) or root
+            path = count > 0 and (`$root/$(concat(segments, "/", 1, count))`) or root
             entry_ok, entry = catch fs.type(path)
             return entry_ok and entry or nil, path
         end
         entry = "directory"
         for i = 1, count do
-            path = path .. "/" .. segments[i]
+            path = `$path/$(segments[i])`
             entry_ok, entry, link = catch fs.type(path)
             if not entry_ok or link then
                 return nil, path
@@ -355,7 +354,7 @@ local function build(options)
         if not read_ok or body == nil then
             return nil
         end
-        local etag = '"' .. string.transcode(crypto.hash("sha256", body), "binary", "hex"):sub(1, 32) .. '"'
+        local etag = `"$(string.transcode(crypto.hash("sha256", body), "binary", "hex"):sub(1, 32))"`
         local memo = seen[path]
         if memo == nil or memo.etag ~= etag then
             local at = os.time()
@@ -445,7 +444,7 @@ local function build(options)
         local count = #segments
         if caching and not trailing then
             -- A file in the cache is served without a look at the disk.
-            if hit = cached[root .. "/" .. concat(segments, "/")] then
+            if hit = cached[`$root/$(concat(segments, "/"))`] then
                 return send(hit, method, request)
             end
         end
@@ -456,7 +455,7 @@ local function build(options)
                 for i = 1, count do
                     encoded[i] = encode_segment(segments[i])
                 end
-                return plain(301, "", { Location = mount .. "/" .. concat(encoded, "/") .. (count > 0 and "/" or "") })
+                return plain(301, "", { Location = `$mount/$(concat(encoded, "/"))$(count > 0 and "/" or "")` })
             end
             entry_type = nil
             for _, name in ipairs(index) do
@@ -491,8 +490,8 @@ end
 ---   paths below it and answers every other path with 404.
 --- - `index`: the file served for a directory, by default `"index.html"`.
 ---   A list names several candidates in order. `false` turns index
----   files off. A directory requested without its final slash redirects
----   to the path with the slash.
+---   files off. A request for a directory without its final slash is
+---   redirected to the path with the slash.
 --- - `max_age`: the seconds a client may cache a file, 0 by default. The
 ---   response carries `Cache-Control: public, max-age=N`. `false` leaves
 ---   the header out.
