@@ -455,3 +455,214 @@ local function network_serve_test()
     coroutine.close(serving)
     server:close()
 end
+
+-- Streams ------------------------------------------------------------------------------
+
+-- A file of 300000 bytes, which is over the default threshold and takes
+-- several parts.
+local LARGE_SIZE = 300000
+do
+    local bytes = vector.create(LARGE_SIZE)
+    for i = 0, LARGE_SIZE - 1 do
+        vector.set(bytes, i, i % 251)
+    end
+    write("public/large.bin", bytes)
+    fs.createlink("public/large-link.bin", "large.bin")
+end
+
+-- Runs a streamed body to its end and returns its parts.
+local function parts_of(body)
+    assert(type(body) == "thread")
+    local parts = {}
+    while true do
+        local ok, part = coroutine.resume(body)
+        assert(ok, part)
+        if part ~= nil then
+            parts[#parts + 1] = part
+        end
+        if coroutine.status(body) == "dead" then
+            return parts
+        end
+    end
+end
+
+local function streams_large_file_test()
+    local status, body, headers = handler({ method = "GET", path = "/large.bin", headers = {} })
+    assert(status == 200 and headers["Content-Length"] == tostring(LARGE_SIZE))
+    assert(headers["Content-Type"] == "application/octet-stream")
+    assert(headers["Accept-Ranges"] == "bytes")
+    -- A streamed file has no validators without the cache.
+    assert(headers.ETag == nil and headers["Last-Modified"] == nil)
+    local parts = parts_of(body)
+    assert(#parts == 5 and #parts[1] == 65536 and #parts[5] == LARGE_SIZE - 4 * 65536)
+    assert(vector.get(parts[1], 7) == 7 and vector.get(parts[1], 300) == 49)
+    assert(vector.get(parts[2], 2) == (65536 + 2) % 251)
+end
+
+local function small_file_stays_whole_test()
+    local _, body = handler({ method = "GET", path = "/hello.txt", headers = {} })
+    assert(type(body) == "vector")
+    local none = static.handler({ root = "public", stream_threshold = 0 })
+    local _, streamed, headers = none({ method = "GET", path = "/hello.txt", headers = {} })
+    assert(vector.tostring(parts_of(streamed)[1]) == "hello world" and headers["Content-Length"] == "11")
+    -- An empty file has nothing to stream.
+    local status, empty = none({ method = "GET", path = "/zero.txt", headers = {} })
+    assert(status == 200 and #empty == 0)
+    raises(function() static.handler({ root = "public", stream_threshold = -1 }) end, "stream_threshold")
+    raises(function() static.handler({ root = "public", stream_threshold = "1k" }) end, "stream_threshold")
+end
+
+local function streams_range_test()
+    local h = static.handler({ root = "public", stream_threshold = 4 })
+    local function ranged(range, method)
+        return h({ method = method or "GET", path = "/data.bin", headers = { range = range } })
+    end
+    local status, body, headers = ranged("bytes=2-5")
+    assert(status == 206 and headers["Content-Range"] == "bytes 2-5/20" and headers["Content-Length"] == "4")
+    assert(vector.tostring(parts_of(body)[1]) == "2345")
+    status, body, headers = ranged("bytes=-4")
+    assert(status == 206 and headers["Content-Range"] == "bytes 16-19/20")
+    assert(vector.tostring(parts_of(body)[1]) == "ghij")
+    status, body, headers = ranged("bytes=15-")
+    assert(status == 206 and headers["Content-Length"] == "5" and vector.tostring(parts_of(body)[1]) == "fghij")
+    status, body, headers = ranged("bytes=40-")
+    assert(status == 416 and body == "range not satisfiable" and headers["Content-Range"] == "bytes */20")
+    -- Several ranges get the whole file.
+    status, body = ranged("bytes=0-1,4-5")
+    assert(status == 200 and vector.tostring(parts_of(body)[1]) == "0123456789abcdefghij")
+    status, body, headers = ranged("bytes=2-5", "HEAD")
+    assert(status == 206 and body == "" and headers["Content-Length"] == "4")
+    -- A range of a large file starts in one part and ends in another.
+    status, body, headers = handler({ method = "GET", path = "/large.bin", headers = { range = "bytes=65530-131080" } })
+    assert(status == 206 and headers["Content-Length"] == "65551")
+    local parts = parts_of(body)
+    assert(#parts == 2 and #parts[1] == 65536 and #parts[2] == 15)
+    assert(vector.get(parts[1], 3) == 65533 % 251)
+end
+
+local function stream_closes_its_file_test()
+    local h = static.handler({ root = "public", stream_threshold = 4 })
+    write("public/closing.txt", "0123456789")
+    local _, body = h({ method = "GET", path = "/closing.txt", headers = {} })
+    assert(coroutine.close(body))
+    assert(coroutine.status(body) == "dead")
+    -- A stream that is closed after its first part closes its file too.
+    local _, large = handler({ method = "GET", path = "/large.bin", headers = {} })
+    local ok, part = coroutine.resume(large)
+    assert(ok and #part == 65536)
+    assert(coroutine.close(large))
+    assert(coroutine.status(large) == "dead")
+    -- A file that became shorter ends the stream early.
+    _, body = h({ method = "GET", path = "/closing.txt", headers = {} })
+    write("public/closing.txt", "01234")
+    local parts = parts_of(body)
+    assert(#parts == 1 and vector.tostring(parts[1]) == "01234")
+    fs.remove("public/closing.txt")
+end
+
+local function stream_validators_with_cache_test()
+    write("public/movie.bin", string.rep("frame", 10))
+    local h = static.handler({ root = "public", cache = true, stream_threshold = 4 })
+    local status, body, headers = h({ method = "GET", path = "/movie.bin", headers = {} })
+    local etag = headers.ETag
+    assert(status == 200 and etag:match('^"%x+"$') and headers["Last-Modified"])
+    assert(vector.tostring(parts_of(body)[1]) == string.rep("frame", 10))
+    -- The ETag of a streamed file is the ETag of the same bytes read whole.
+    local whole = static.handler({ root = "public" })
+    local _, _, whole_headers = whole({ method = "GET", path = "/movie.bin", headers = {} })
+    assert(whole_headers.ETag == etag)
+    status, body = h({ method = "GET", path = "/movie.bin", headers = { ["if-none-match"] = etag } })
+    assert(status == 304 and body == "")
+    status = h({ method = "GET", path = "/movie.bin", headers = { ["if-modified-since"] = headers["Last-Modified"] } })
+    assert(status == 304)
+    status, body = h({ method = "GET", path = "/movie.bin", headers = { range = "bytes=0-4", ["if-range"] = etag } })
+    assert(status == 206 and vector.tostring(parts_of(body)[1]) == "frame")
+    status, body = h({ method = "GET", path = "/movie.bin", headers = { range = "bytes=0-4", ["if-range"] = '"other"' } })
+    assert(status == 200 and #parts_of(body)[1] == 50)
+    -- The cache keeps the validators, and the content comes from the disk.
+    fs.remove("public/movie.bin")
+    assert(h({ method = "GET", path = "/movie.bin", headers = {} }) == 404)
+    assert(h({ method = "HEAD", path = "/movie.bin", headers = {} }) == 200)
+end
+
+local function stream_without_validators_test()
+    local h = static.handler({ root = "public", stream_threshold = 4 })
+    local status, body = h({ method = "GET", path = "/data.bin", headers = { ["if-none-match"] = "*" } })
+    assert(status == 200)
+    coroutine.close(body)
+    status, body = h({ method = "GET", path = "/data.bin", headers = { ["if-modified-since"] = "Sun, 06 Nov 2094 08:49:37 GMT" } })
+    assert(status == 200)
+    coroutine.close(body)
+    -- An If-Range has no validator to match, so the whole file goes out.
+    status, body = h({ method = "GET", path = "/data.bin", headers = { range = "bytes=0-1", ["if-range"] = '"x"' } })
+    assert(status == 200 and #parts_of(body)[1] == 20)
+end
+
+local function stream_security_test()
+    local h = static.handler({ root = "public", stream_threshold = 0 })
+    for _, path in ipairs({ "/../secret.txt", "/%2e%2e/secret.txt", "/..%2fsecret.txt", "/..%5csecret.txt", "/docs/../../secret.txt" }) do
+        assert(get(h, path).status == 403)
+    end
+    assert(get(h, "/.env").status == 404)
+    assert(get(h, "/link.txt").status == 404)
+    assert(get(h, "/linkdir/secret.txt").status == 404)
+    assert(get(handler, "/large-link.bin").status == 404)
+    assert(get(h, "/hello.txt/").status == 404)
+    assert(get(h, "/docs").status == 301)
+    local linked = static.handler({ root = "public", links = true })
+    local status, body = linked({ method = "GET", path = "/large-link.bin", headers = {} })
+    assert(status == 200 and #parts_of(body) == 5)
+end
+
+local function web_stream_test()
+    local app = web.app()
+    local sent
+    app:hook("on_send", function(_req, status, body, headers)
+        sent = type(body)
+        return status, body, headers
+    end)
+    app:register(static, { root = "public", prefix = "/assets" })
+    local res = app:inject({ path = "/assets/large.bin" })
+    assert(res.status == 200 and sent == "thread")
+    assert(#res.chunks == 5 and #res:bytes() == LARGE_SIZE)
+    assert(res.headers["content-length"] == tostring(LARGE_SIZE))
+    assert(vector.get(res:bytes(), 299999) == 299999 % 251)
+    res = app:inject({ path = "/assets/large.bin", headers = { Range = "bytes=-10" } })
+    assert(res.status == 206 and #res:bytes() == 10)
+    assert(res.headers["content-range"] == `bytes 299990-299999/$LARGE_SIZE`)
+    res = app:inject({ method = "HEAD", path = "/assets/large.bin" })
+    assert(res.status == 200 and res.body == "" and res.headers["content-length"] == tostring(LARGE_SIZE))
+end
+
+local function network_serve_stream_test()
+    local ok, server = catch network.tcp.bind("127.0.0.1", 0)
+    if not ok then
+        skip("cannot bind a local port here")
+    end
+    local _, port = server:getsockname()
+    local serving = coroutine.detach(coroutine.create(network.serve), server, handler)
+    local url = `http://127.0.0.1:$port/large.bin`
+    local status, body, headers = network.fetch(url)
+    assert(status == 200 and #body == LARGE_SIZE)
+    assert(headers["content-length"] == tostring(LARGE_SIZE))
+    local file <close> = io.open("public/large.bin", "rb")
+    assert(crypto.equal(crypto.hash("sha256", body), crypto.hash("sha256", file:read("a"))))
+    status, body, headers = network.fetch(url, "GET", { Range = "bytes=100000-199999" })
+    assert(status == 206 and #body == 100000)
+    assert(headers["content-range"] == `bytes 100000-199999/$LARGE_SIZE`)
+    assert(vector.get(body, 5) == 100005 % 251)
+    status, body, headers = network.fetch(url, "HEAD")
+    assert(status == 200 and #body == 0 and headers["content-length"] == tostring(LARGE_SIZE))
+    -- A streamed response arrives in parts.
+    local count = 0
+    local _, streamed = network.fetch(url, "GET", nil, nil, { stream = true })
+    while true do
+        local resumed, part = coroutine.resume(streamed)
+        assert(resumed, part)
+        if part == nil then break end
+        count = count + #part
+    end
+    assert(count == LARGE_SIZE)
+    coroutine.close(serving)
+    server:close()
+end
