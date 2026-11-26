@@ -1,19 +1,9 @@
-# static
+# [static](https://atmosp.here/2.0/static)
 
-`static` serves the files of a directory over HTTP with content types, `ETag` and `Last-Modified` validators, `Range` requests, `Cache-Control`, and index files, refusing any path that leaves the root. It works as a `web` plugin and as a handler for `network.serve`.
+Static file server for Lus.
 
-The following example serves a `public` directory under `/assets` of a web application, then as a server of its own.
+[Instructions for using static can be found here.](https://atmosp.here/2.0/static)
 
-```lus nocheck
-local static = require("https://atmosp.here/2.0/static.lus")
+## License
 
--- As a plugin of a web application, under a prefix.
-app:register(static, { root = "public", prefix = "/assets", max_age = 3600 })
-
--- As a server of its own.
-network.serve("0.0.0.0", 8080, static.handler({ root = "public" }))
-```
-
-The package requires Lus 2.0 and declares the permission `fs:read`, which it uses to read the directory it serves. It never calls `pledge`, so the program that loads it keeps control of its permissions.
-
-The reference is in the doc comments of `static.lus`, which `lus doc static.lus` prints.
+`static` is licensed under the 0-clause BSD license. It may be used for any purpose, including commercial purposes, at no cost. [For more details, consult the license here.](LICENSE)

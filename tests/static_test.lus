@@ -7,9 +7,8 @@ local static = require("static")
 local web = require("web")
 
 local function write(path, content)
-    local file = io.open(path, "wb")
+    local file <close> = io.open(path, "wb")
     file:write(content)
-    file:close()
 end
 
 -- The tree that the tests serve, in the temporary directory of the run.
@@ -36,11 +35,14 @@ write("outside/secret.txt", "top secret")
 write("secret.txt", "next to the root")
 fs.createlink("public/link.txt", "../outside/secret.txt")
 fs.createlink("public/linkdir", "../outside")
+
 do
     local bytes = vector.create(256)
+
     for i = 0, 255 do
         vector.set(bytes, i, i)
     end
+
     write("public/bytes.bin", bytes)
 end
 
@@ -49,11 +51,17 @@ local handler = static.handler({ root = "public" })
 -- Calls a bare handler the way network.serve does.
 local function get(h, path, headers, method)
     local status, body, out = h({
-        method = method or "GET", path = path, query = "", headers = headers or {}, body = vector.create(0),
+        method = method or "GET",
+        path = path,
+        query = "",
+        headers = headers or {},
+        body = vector.create(0),
     })
+
     if type(body) == "vector" then
         body = vector.tostring(body, 0, #body, "lossy")
     end
+
     return { status = status, body = body, headers = out or {} }
 end
 
@@ -74,8 +82,23 @@ local function validators_from_stat_test()
     local res = get(handler, "/hello.txt")
     local nanos = info.modified:epoch() * 1000000000 + info.modified:nanos()
     assert(res.headers.ETag == string.format('"%x-%x"', 11, nanos), res.headers.ETag)
-    local d, mon, y, h, mi, sec = res.headers["Last-Modified"]:match("^%a+, (%d+) (%a+) (%d+) (%d+):(%d+):(%d+) GMT$")
-    local months = { Jan = 1, Feb = 2, Mar = 3, Apr = 4, May = 5, Jun = 6, Jul = 7, Aug = 8, Sep = 9, Oct = 10, Nov = 11, Dec = 12 }
+    local d, mon, y, h, mi, sec = res.headers["Last-Modified"]:match(
+        "^%a+, (%d+) (%a+) (%d+) (%d+):(%d+):(%d+) GMT$"
+    )
+    local months = {
+        Jan = 1,
+        Feb = 2,
+        Mar = 3,
+        Apr = 4,
+        May = 5,
+        Jun = 6,
+        Jul = 7,
+        Aug = 8,
+        Sep = 9,
+        Oct = 10,
+        Nov = 11,
+        Dec = 12,
+    }
     local parsed = time.parse(string.format("%s-%02d-%sT%s:%s:%sZ", y, months[mon], d, h, mi, sec))
     assert(parsed:epoch() == info.modified:epoch())
 end
@@ -187,11 +210,20 @@ local function if_modified_since_test()
     local first = get(handler, "/hello.txt")
     local modified = first.headers["Last-Modified"]
     assert(get(handler, "/hello.txt", { ["if-modified-since"] = modified }).status == 304)
-    assert(get(handler, "/hello.txt", { ["if-modified-since"] = "Sun, 06 Nov 1994 08:49:37 GMT" }).status == 200)
-    assert(get(handler, "/hello.txt", { ["if-modified-since"] = "Fri, 01 Jan 2100 00:00:00 GMT" }).status == 304)
+    assert(
+        get(handler, "/hello.txt", { ["if-modified-since"] = "Sun, 06 Nov 1994 08:49:37 GMT" }).status
+            == 200
+    )
+    assert(
+        get(handler, "/hello.txt", { ["if-modified-since"] = "Fri, 01 Jan 2100 00:00:00 GMT" }).status
+            == 304
+    )
     assert(get(handler, "/hello.txt", { ["if-modified-since"] = "yesterday" }).status == 200)
     -- If-None-Match takes precedence over the date.
-    local res = get(handler, "/hello.txt", { ["if-none-match"] = '"other"', ["if-modified-since"] = modified })
+    local res = get(handler, "/hello.txt", {
+        ["if-none-match"] = '"other"',
+        ["if-modified-since"] = modified,
+    })
     assert(res.status == 200)
 end
 
@@ -218,11 +250,19 @@ local function range_unsatisfiable_test()
         assert(res.status == 416)
         assert(res.headers["Content-Range"] == "bytes */20")
     end
+
     assert(get(handler, "/zero.txt", { range = "bytes=-5" }).status == 416)
 end
 
 local function range_ignored_test()
-    for _, range in ipairs({ "bytes=0-1,5-6", "items=0-4", "bytes=5-2", "bytes=abc", "bytes=-", "bytes" }) do
+    for _, range in ipairs({
+        "bytes=0-1,5-6",
+        "items=0-4",
+        "bytes=5-2",
+        "bytes=abc",
+        "bytes=-",
+        "bytes",
+    }) do
         local res = get(handler, "/data.bin", { range = range })
         assert(res.status == 200 and #res.body == 20)
         assert(res.headers["Content-Range"] == nil)
@@ -231,14 +271,23 @@ end
 
 local function if_range_test()
     local first = get(handler, "/data.bin")
-    local res = get(handler, "/data.bin", { range = "bytes=0-1", ["if-range"] = first.headers["Last-Modified"] })
+    local res = get(handler, "/data.bin", {
+        range = "bytes=0-1",
+        ["if-range"] = first.headers["Last-Modified"],
+    })
     assert(res.status == 206 and res.body == "01")
     res = get(handler, "/data.bin", { range = "bytes=0-1", ["if-range"] = first.headers.ETag })
     assert(res.status == 206 and res.body == "01")
     -- An If-Range compares strongly, so the same tag with `W/` differs.
-    res = get(handler, "/data.bin", { range = "bytes=0-1", ["if-range"] = `W/$(first.headers.ETag)` })
+    res = get(handler, "/data.bin", {
+        range = "bytes=0-1",
+        ["if-range"] = `W/$(first.headers.ETag)`,
+    })
     assert(res.status == 200 and #res.body == 20)
-    res = get(handler, "/data.bin", { range = "bytes=0-1", ["if-range"] = "Sun, 06 Nov 1994 08:49:37 GMT" })
+    res = get(handler, "/data.bin", {
+        range = "bytes=0-1",
+        ["if-range"] = "Sun, 06 Nov 1994 08:49:37 GMT",
+    })
     assert(res.status == 200 and #res.body == 20)
     res = get(handler, "/data.bin", { range = "bytes=0-1", ["if-range"] = '"stale"' })
     assert(res.status == 200 and #res.body == 20)
@@ -254,7 +303,11 @@ local function cache_control_test()
     assert(get(h, "/hello.txt").headers["Cache-Control"] == "public, max-age=31536000, immutable")
     h = static.handler({ root = "public", max_age = 3600.9 })
     assert(get(h, "/hello.txt").headers["Cache-Control"] == "public, max-age=3600")
-    h = static.handler({ root = "public", max_age = false, headers = { ["X-Content-Type-Options"] = "nosniff" } })
+    h = static.handler({
+        root = "public",
+        max_age = false,
+        headers = { ["X-Content-Type-Options"] = "nosniff" },
+    })
     local res = get(h, "/hello.txt")
     assert(res.headers["Cache-Control"] == nil)
     assert(res.headers["X-Content-Type-Options"] == "nosniff")
@@ -298,7 +351,17 @@ local function double_encoding_test()
     assert(get(handler, "/%252e%252e%252fsecret.txt").status == 404)
 end
 
-local malformed_cases = { "/%", "/%2", "/%zz", "/a%0", "/hello.txt%00", "/%00", "/%ff%fe", "/%c3", "/%ed%a0%80%ed%b0%80x%ff" }
+local malformed_cases = {
+    "/%",
+    "/%2",
+    "/%zz",
+    "/a%0",
+    "/hello.txt%00",
+    "/%00",
+    "/%ff%fe",
+    "/%c3",
+    "/%ed%a0%80%ed%b0%80x%ff",
+}
 
 local function malformed_test(case)
     assert(get(handler, case).status == 400)
@@ -321,6 +384,7 @@ local function dotfiles_test()
     for _, path in ipairs({ "/.env", "/.git/config", "/.git/", "/%2eenv", "/css/.hidden" }) do
         assert(get(handler, path).status == 404)
     end
+
     local deny = static.handler({ root = "public", dotfiles = "deny" })
     assert(get(deny, "/.env").status == 403)
     assert(get(deny, "/.git/config").status == 403)
@@ -340,10 +404,21 @@ local function symlink_test()
 end
 
 local function invalid_options_test()
-    raises(function() static.handler({}) end, "root option")
-    raises(function() static.handler({ root = "missing-directory" }) end, "is not a directory")
-    raises(function() static.handler({ root = "public/hello.txt" }) end, "is not a directory")
-    raises(function() static.handler({ root = "public", dotfiles = "show" }) end, "dotfiles must be")
+    raises(function()
+        static.handler({})
+    end, "root option")
+
+    raises(function()
+        static.handler({ root = "missing-directory" })
+    end, "is not a directory")
+
+    raises(function()
+        static.handler({ root = "public/hello.txt" })
+    end, "is not a directory")
+
+    raises(function()
+        static.handler({ root = "public", dotfiles = "show" })
+    end, "dotfiles must be")
 end
 
 -- Prefix, fallback, and cache ------------------------------------------------------
@@ -385,7 +460,11 @@ end
 
 local function web_plugin_test()
     local app = web.app()
-    app:get("/api/ping", function() return { pong = true } end)
+
+    app:get("/api/ping", function()
+        return { pong = true }
+    end)
+
     app:register(static, { root = "public", prefix = "/assets", max_age = 60 })
     local res = app:inject({ path = "/assets/hello.txt" })
     assert(res.status == 200 and res.body == "hello world")
@@ -403,9 +482,14 @@ local function web_conditional_and_range_test()
     local app = web.app()
     app:register(static, { root = "public" })
     local first = app:inject({ path = "/data.bin" })
-    assert(app:inject({ path = "/data.bin", headers = { ["If-None-Match"] = first.headers.etag } }).status == 304)
+    assert(
+        app:inject({ path = "/data.bin", headers = { ["If-None-Match"] = first.headers.etag } }).status
+            == 304
+    )
     local res = app:inject({ path = "/data.bin", headers = { Range = "bytes=2-5" } })
-    assert(res.status == 206 and res.body == "2345" and res.headers["content-range"] == "bytes 2-5/20")
+    assert(
+        res.status == 206 and res.body == "2345" and res.headers["content-range"] == "bytes 2-5/20"
+    )
     res = app:inject({ method = "HEAD", path = "/data.bin" })
     assert(res.status == 200 and res.body == "" and res.headers["content-length"] == "20")
     assert(app:inject({ method = "POST", path = "/data.bin" }).status == 405)
@@ -426,10 +510,17 @@ end
 local function web_security_test()
     local app = web.app()
     app:register(static, { root = "public", prefix = "/files" })
-    for _, path in ipairs({ "/files/../secret.txt", "/files/%2e%2e/secret.txt", "/files/..%5csecret.txt", "/files/..%2f..%2fsecret.txt" }) do
+
+    for _, path in ipairs({
+        "/files/../secret.txt",
+        "/files/%2e%2e/secret.txt",
+        "/files/..%5csecret.txt",
+        "/files/..%2f..%2fsecret.txt",
+    }) do
         local res = app:inject({ path = path })
         assert(res.status == 403)
     end
+
     assert(app:inject({ path = "/files/.env" }).status == 404)
     assert(app:inject({ path = "/files/link.txt" }).status == 404)
     assert(app:inject({ path = "/files/%zz" }).status == 400)
@@ -438,10 +529,15 @@ end
 local function web_scope_prefix_and_hooks_test()
     local app = web.app()
     local seen = {}
+
     app:register(function(scope)
-        scope:hook("on_response", function(req, status) seen[#seen + 1] = `$(req.path) $status` end)
+        scope:hook("on_response", function(req, status)
+            seen[#seen + 1] = `$(req.path) $status`
+        end)
+
         scope:register(static, { root = "public", prefix = "/static" })
     end, { prefix = "/site" })
+
     assert(app:inject({ path = "/site/static/hello.txt" }).body == "hello world")
     assert(app:inject({ path = "/site/static/docs" }).headers.location == "/site/static/docs/")
     assert(seen[1] == "/site/static/hello.txt 200")
@@ -451,16 +547,20 @@ end
 
 local function network_serve_test()
     local server = network.tcp.bind("127.0.0.1", 0)
+
     if not server then
         skip("cannot bind a local port here")
     end
+
     local _, port = server:getsockname()
     local serving = coroutine.detach(coroutine.create(network.serve), server, handler)
+
     local function request(text)
         local sock <close> = network.tcp.connect("127.0.0.1", port)
         sock:send(text .. "Host: localhost\r\nConnection: close\r\n\r\n")
         return vector.tostring(sock:receive("*a"), 0, nil, "lossy")
     end
+
     local response = request("GET /hello.txt HTTP/1.1\r\n")
     assert(response:find("^HTTP/1.1 200"))
     assert(response:find("Content-Length: 11\r\n", 1, true))
@@ -485,11 +585,14 @@ end
 -- A file of 300000 bytes, which is over the default threshold and takes
 -- several parts.
 local LARGE_SIZE = 300000
+
 do
     local bytes = vector.create(LARGE_SIZE)
+
     for i = 0, LARGE_SIZE - 1 do
         vector.set(bytes, i, i % 251)
     end
+
     write("public/large.bin", bytes)
     fs.createlink("public/large-link.bin", "large.bin")
 end
@@ -498,12 +601,15 @@ end
 local function parts_of(body)
     assert(type(body) == "thread")
     local parts = {}
+
     while true do
         local ok, part = coroutine.resume(body)
         assert(ok, part)
+
         if part ~= nil then
             parts[#parts + 1] = part
         end
+
         if coroutine.status(body) == "dead" then
             return parts
         end
@@ -517,7 +623,14 @@ local function streams_large_file_test()
     assert(headers["Accept-Ranges"] == "bytes")
     -- A streamed file has its validators without the cache.
     local info = fs.stat("public/large.bin")
-    assert(headers.ETag == string.format('"%x-%x"', LARGE_SIZE, info.modified:epoch() * 1000000000 + info.modified:nanos()))
+    assert(
+        headers.ETag
+            == string.format(
+                '"%x-%x"',
+                LARGE_SIZE,
+                info.modified:epoch() * 1000000000 + info.modified:nanos()
+            )
+    )
     assert(headers["Last-Modified"] ~= nil)
     local parts = parts_of(body)
     assert(#parts == 5 and #parts[1] == 65536 and #parts[5] == LARGE_SIZE - 4 * 65536)
@@ -530,36 +643,63 @@ local function small_file_stays_whole_test()
     assert(type(body) == "vector")
     local none = static.handler({ root = "public", stream_threshold = 0 })
     local _, streamed, headers = none({ method = "GET", path = "/hello.txt", headers = {} })
-    assert(vector.tostring(parts_of(streamed)[1]) == "hello world" and headers["Content-Length"] == "11")
+    assert(
+        vector.tostring(parts_of(streamed)[1]) == "hello world"
+            and headers["Content-Length"] == "11"
+    )
     -- An empty file has nothing to stream.
     local status, empty = none({ method = "GET", path = "/zero.txt", headers = {} })
     assert(status == 200 and #empty == 0)
-    raises(function() static.handler({ root = "public", stream_threshold = -1 }) end, "stream_threshold")
-    raises(function() static.handler({ root = "public", stream_threshold = "1k" }) end, "stream_threshold")
+
+    raises(function()
+        static.handler({ root = "public", stream_threshold = -1 })
+    end, "stream_threshold")
+
+    raises(function()
+        static.handler({ root = "public", stream_threshold = "1k" })
+    end, "stream_threshold")
 end
 
 local function streams_range_test()
     local h = static.handler({ root = "public", stream_threshold = 4 })
+
     local function ranged(range, method)
         return h({ method = method or "GET", path = "/data.bin", headers = { range = range } })
     end
+
     local status, body, headers = ranged("bytes=2-5")
-    assert(status == 206 and headers["Content-Range"] == "bytes 2-5/20" and headers["Content-Length"] == "4")
+    assert(
+        status == 206
+            and headers["Content-Range"] == "bytes 2-5/20"
+            and headers["Content-Length"] == "4"
+    )
     assert(vector.tostring(parts_of(body)[1]) == "2345")
     status, body, headers = ranged("bytes=-4")
     assert(status == 206 and headers["Content-Range"] == "bytes 16-19/20")
     assert(vector.tostring(parts_of(body)[1]) == "ghij")
     status, body, headers = ranged("bytes=15-")
-    assert(status == 206 and headers["Content-Length"] == "5" and vector.tostring(parts_of(body)[1]) == "fghij")
+    assert(
+        status == 206
+            and headers["Content-Length"] == "5"
+            and vector.tostring(parts_of(body)[1]) == "fghij"
+    )
     status, body, headers = ranged("bytes=40-")
-    assert(status == 416 and body == "range not satisfiable" and headers["Content-Range"] == "bytes */20")
+    assert(
+        status == 416
+            and body == "range not satisfiable"
+            and headers["Content-Range"] == "bytes */20"
+    )
     -- Several ranges get the whole file.
     status, body = ranged("bytes=0-1,4-5")
     assert(status == 200 and vector.tostring(parts_of(body)[1]) == "0123456789abcdefghij")
     status, body, headers = ranged("bytes=2-5", "HEAD")
     assert(status == 206 and body == "" and headers["Content-Length"] == "4")
     -- A range of a large file starts in one part and ends in another.
-    status, body, headers = handler({ method = "GET", path = "/large.bin", headers = { range = "bytes=65530-131080" } })
+    status, body, headers = handler({
+        method = "GET",
+        path = "/large.bin",
+        headers = { range = "bytes=65530-131080" },
+    })
     assert(status == 206 and headers["Content-Length"] == "65551")
     local parts = parts_of(body)
     assert(#parts == 2 and #parts[1] == 65536 and #parts[2] == 15)
@@ -596,30 +736,66 @@ local function stream_validators_test()
     -- A streamed file and the same file read whole have the same validators.
     local whole = static.handler({ root = "public" })
     local _, _, whole_headers = whole({ method = "GET", path = "/movie.bin", headers = {} })
-    assert(whole_headers.ETag == etag and whole_headers["Last-Modified"] == headers["Last-Modified"])
-    status, body = h({ method = "GET", path = "/movie.bin", headers = { ["if-none-match"] = etag } })
+    assert(
+        whole_headers.ETag == etag and whole_headers["Last-Modified"] == headers["Last-Modified"]
+    )
+    status, body = h(
+        { method = "GET", path = "/movie.bin", headers = { ["if-none-match"] = etag } }
+    )
     assert(status == 304 and body == "")
     status, body = h({ method = "GET", path = "/movie.bin", headers = { ["if-none-match"] = "*" } })
     assert(status == 304 and body == "")
-    status, body = h({ method = "GET", path = "/movie.bin", headers = { ["if-none-match"] = '"x"' } })
+    status, body = h({
+        method = "GET",
+        path = "/movie.bin",
+        headers = { ["if-none-match"] = '"x"' },
+    })
     assert(status == 200)
     coroutine.close(body)
-    status = h({ method = "GET", path = "/movie.bin", headers = { ["if-modified-since"] = headers["Last-Modified"] } })
+    status = h({
+        method = "GET",
+        path = "/movie.bin",
+        headers = { ["if-modified-since"] = headers["Last-Modified"] },
+    })
     assert(status == 304)
-    status = h({ method = "GET", path = "/movie.bin", headers = { ["if-modified-since"] = "Sun, 06 Nov 2094 08:49:37 GMT" } })
+    status = h({
+        method = "GET",
+        path = "/movie.bin",
+        headers = { ["if-modified-since"] = "Sun, 06 Nov 2094 08:49:37 GMT" },
+    })
     assert(status == 304)
-    status, body = h({ method = "GET", path = "/movie.bin", headers = { ["if-modified-since"] = "Sun, 06 Nov 1994 08:49:37 GMT" } })
+    status, body = h({
+        method = "GET",
+        path = "/movie.bin",
+        headers = { ["if-modified-since"] = "Sun, 06 Nov 1994 08:49:37 GMT" },
+    })
     assert(status == 200)
     coroutine.close(body)
-    status, body = h({ method = "GET", path = "/movie.bin", headers = { range = "bytes=0-4", ["if-range"] = headers["Last-Modified"] } })
+    status, body = h({
+        method = "GET",
+        path = "/movie.bin",
+        headers = { range = "bytes=0-4", ["if-range"] = headers["Last-Modified"] },
+    })
     assert(status == 206 and vector.tostring(parts_of(body)[1]) == "frame")
-    status, body = h({ method = "GET", path = "/movie.bin", headers = { range = "bytes=0-4", ["if-range"] = etag } })
+    status, body = h({
+        method = "GET",
+        path = "/movie.bin",
+        headers = { range = "bytes=0-4", ["if-range"] = etag },
+    })
     assert(status == 206 and vector.tostring(parts_of(body)[1]) == "frame")
-    status, body = h({ method = "GET", path = "/movie.bin", headers = { range = "bytes=0-4", ["if-range"] = '"other"' } })
+    status, body = h({
+        method = "GET",
+        path = "/movie.bin",
+        headers = { range = "bytes=0-4", ["if-range"] = '"other"' },
+    })
     assert(status == 200 and #parts_of(body)[1] == 50)
     -- The validators follow the file.
     write("public/movie.bin", string.rep("frame", 11))
-    status, body, headers = h({ method = "GET", path = "/movie.bin", headers = { ["if-none-match"] = etag } })
+    status, body, headers = h({
+        method = "GET",
+        path = "/movie.bin",
+        headers = { ["if-none-match"] = etag },
+    })
     assert(status == 200 and headers.ETag ~= etag and headers["Content-Length"] == "55")
     coroutine.close(body)
     fs.remove("public/movie.bin")
@@ -640,9 +816,17 @@ end
 
 local function stream_security_test()
     local h = static.handler({ root = "public", stream_threshold = 0 })
-    for _, path in ipairs({ "/../secret.txt", "/%2e%2e/secret.txt", "/..%2fsecret.txt", "/..%5csecret.txt", "/docs/../../secret.txt" }) do
+
+    for _, path in ipairs({
+        "/../secret.txt",
+        "/%2e%2e/secret.txt",
+        "/..%2fsecret.txt",
+        "/..%5csecret.txt",
+        "/docs/../../secret.txt",
+    }) do
         assert(get(h, path).status == 403)
     end
+
     assert(get(h, "/.env").status == 404)
     assert(get(h, "/link.txt").status == 404)
     assert(get(h, "/linkdir/secret.txt").status == 404)
@@ -657,10 +841,12 @@ end
 local function web_stream_test()
     local app = web.app()
     local sent
+
     app:hook("on_send", function(_req, status, body, headers)
         sent = type(body)
         return status, body, headers
     end)
+
     app:register(static, { root = "public", prefix = "/assets" })
     local res = app:inject({ path = "/assets/large.bin" })
     assert(res.status == 200 and sent == "thread")
@@ -671,14 +857,20 @@ local function web_stream_test()
     assert(res.status == 206 and #res:bytes() == 10)
     assert(res.headers["content-range"] == `bytes 299990-299999/$LARGE_SIZE`)
     res = app:inject({ method = "HEAD", path = "/assets/large.bin" })
-    assert(res.status == 200 and res.body == "" and res.headers["content-length"] == tostring(LARGE_SIZE))
+    assert(
+        res.status == 200
+            and res.body == ""
+            and res.headers["content-length"] == tostring(LARGE_SIZE)
+    )
 end
 
 local function network_serve_stream_test()
     local server = network.tcp.bind("127.0.0.1", 0)
+
     if not server then
         skip("cannot bind a local port here")
     end
+
     local _, port = server:getsockname()
     local serving = coroutine.detach(coroutine.create(network.serve), server, handler)
     local url = `http://127.0.0.1:$port/large.bin`
@@ -696,12 +888,18 @@ local function network_serve_stream_test()
     -- A streamed response arrives in parts.
     local count = 0
     local _, streamed = network.fetch(url, "GET", nil, nil, { stream = true })
+
     while true do
         local resumed, part = coroutine.resume(streamed)
         assert(resumed, part)
-        if part == nil then break end
+
+        if part == nil then
+            break
+        end
+
         count = count + #part
     end
+
     assert(count == LARGE_SIZE)
     coroutine.close(serving)
     server:close()

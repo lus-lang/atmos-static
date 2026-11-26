@@ -21,6 +21,19 @@
 --- the same memory whatever the size of the file. A streamed response
 --- carries the same validators as any other.
 ---
+--- The following lines serve a `public` directory under `/assets` of a
+--- `web` application, then as a server of its own.
+---
+--- ```lus nocheck
+--- local web = require("https://atmosp.here/2.0/web.lus")
+--- local static = require("https://atmosp.here/2.0/static.lus")
+---
+--- local app = web.app()
+--- app:register(static, { root = "public", prefix = "/assets", max_age = 3600 })
+---
+--- network.serve("0.0.0.0", 8080, static.handler({ root = "public" }))
+--- ```
+---
 --- @package static
 --- @version 1.0.0
 --- @lus 2.0
@@ -98,8 +111,22 @@ end
 -- HTTP dates ------------------------------------------------------------------------
 
 local DAYS = { [0] = "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" }
-local MONTHS = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
+local MONTHS = {
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+}
 local MONTH_NUMBERS = {}
+
 for i, name in ipairs(MONTHS) do
     MONTH_NUMBERS[name] = i
 end
@@ -107,22 +134,30 @@ end
 -- Formats Unix seconds as an HTTP date such as
 -- `Sun, 06 Nov 1994 08:49:37 GMT`.
 local function http_date(seconds)
-    local w, d, m, rest = time.instant(seconds):format("%w %d %m %Y %H:%M:%S"):match("^(%d) (%d+) (%d+) (.*)$")
+    local w, d, m, rest = time.instant(seconds):format("%w %d %m %Y %H:%M:%S"):match(
+        "^(%d) (%d+) (%d+) (.*)$"
+    )
     return `$(DAYS[tonumber(w)]), $d $(MONTHS[tonumber(m)]) $rest GMT`
 end
 
 -- Parses an HTTP date into Unix seconds, or returns nil.
 local function parse_http_date(text)
-    local d, mon, y, h, mi, s = text:match("^%a+, (%d%d) (%a%a%a) (%d%d%d%d) (%d%d):(%d%d):(%d%d) GMT$")
+    local d, mon, y, h, mi, s = text:match(
+        "^%a+, (%d%d) (%a%a%a) (%d%d%d%d) (%d%d):(%d%d):(%d%d) GMT$"
+    )
     local m = MONTH_NUMBERS[mon]
+
     if m == nil then
         return nil
     end
-    local ok, instant = catch time.parse(string.format("%s-%02d-%sT%s:%s:%sZ", y, m, d, h, mi, s))
-    if not ok then
-        return nil
+
+    local iso = string.format("%s-%02d-%sT%s:%s:%sZ", y, m, d, h, mi, s)
+
+    if ok, instant = catch time.parse(iso) then
+        return instant:epoch()
     end
-    return instant:epoch()
+
+    return nil
 end
 
 -- Paths ----------------------------------------------------------------------------------
@@ -135,6 +170,7 @@ local function hex_value(byte)
     elseif byte >= 97 and byte <= 102 then
         return byte - 87
     end
+
     return nil
 end
 
@@ -144,32 +180,42 @@ local function percent_decode(path)
     if path:find("%", 1, true) == nil then
         return path
     end
+
     local bytes = vector.fromstring(path)
     local size = #bytes
     local out = vector.create(size)
     local i, n = 0, 0
+
     while i < size do
         local byte = vector.get(bytes, i)
+
         if byte == 37 then
             if i + 2 >= size then
                 return nil
             end
-            local high, low = hex_value(vector.get(bytes, i + 1)), hex_value(vector.get(bytes, i + 2))
+
+            local high, low = hex_value(vector.get(bytes, i + 1)), hex_value(
+                vector.get(bytes, i + 2)
+            )
+
             if high == nil or low == nil then
                 return nil
             end
+
             byte = high * 16 + low
             i = i + 2
         end
+
         vector.set(out, n, byte)
         n = n + 1
         i = i + 1
     end
-    local ok, text = catch vector.tostring(out, 0, n)
-    if not ok then
-        return nil
+
+    if ok, text = catch vector.tostring(out, 0, n) then
+        return text
     end
-    return text
+
+    return nil
 end
 
 -- Encodes one path segment for a Location header.
@@ -177,17 +223,21 @@ local function encode_segment(segment)
     if segment:find("^[%w%-%._~]*$") then
         return segment
     end
+
     local bytes = vector.fromstring(segment)
     local parts = {}
+
     for i = 0, #bytes - 1 do
         local byte = vector.get(bytes, i)
         local char = byte < 128 and string.char(byte) or ""
+
         if char:find("^[%w%-%._~]$") then
             parts[#parts + 1] = char
         else
             parts[#parts + 1] = string.format("%%%02X", byte)
         end
     end
+
     return concat(parts)
 end
 
@@ -196,13 +246,17 @@ end
 -- the status that refuses the path.
 local function resolve(path, dotfiles, windows)
     local decoded = percent_decode(path)
+
     if decoded == nil or decoded:find("\0", 1, true) then
         return nil, 400
     end
+
     if decoded:find("\\", 1, true) then
         return nil, 403
     end
+
     local segments, n = {}, 0
+
     for segment in decoded:gmatch("[^/]+") do
         if segment == ".." then
             return nil, 403
@@ -210,13 +264,16 @@ local function resolve(path, dotfiles, windows)
             if segment:sub(1, 1) == "." and dotfiles ~= "allow" then
                 return nil, dotfiles == "deny" and 403 or 404
             end
+
             if windows and segment:find(":", 1, true) then
                 return nil, 403
             end
+
             n = n + 1
             segments[n] = segment
         end
     end
+
     return segments, decoded:sub(-1) == "/"
 end
 
@@ -226,11 +283,13 @@ local TEXT = "text/plain; charset=utf-8"
 
 local function plain(status, text, extra)
     local headers = { ["Content-Type"] = TEXT }
+
     if extra then
         for k, v in pairs(extra) do
             headers[k] = v
         end
     end
+
     return status, text, headers
 end
 
@@ -240,11 +299,13 @@ local function etag_listed(list, etag)
     if list:find("*", 1, true) and list:match("^%s*%*%s*$") then
         return true
     end
+
     for candidate in list:gmatch('W?/?("[^"]*")') do
         if candidate == etag then
             return true
         end
     end
+
     return false
 end
 
@@ -253,34 +314,46 @@ end
 -- a header to ignore.
 local function parse_range(header, size)
     local spec = header:match("^bytes=(.*)$")
+
     if spec == nil or spec:find(",", 1, true) then
         return nil
     end
+
     local first, last = spec:match("^%s*(%d*)%-(%d*)%s*$")
+
     if first == nil or (first == "" and last == "") then
         return nil
     end
+
     if first == "" then
         local suffix = tonumber(last)
+
         if suffix == 0 or size == 0 then
             return false
         end
+
         if suffix > size then
             suffix = size
         end
+
         return size - suffix, size - 1
     end
+
     local start = tonumber(first)
     local stop = last == "" and size - 1 or tonumber(last)
+
     if last ~= "" and stop < start then
         return nil
     end
+
     if start >= size then
         return false
     end
+
     if stop >= size then
         stop = size - 1
     end
+
     return start, stop
 end
 
@@ -297,15 +370,20 @@ local function stream(file, start, length)
         local source <close> = file
         source:seek("set", start)
         local left = length
+
         while left > 0 do
             local part = source:read(left < PART and left or PART)
+
             if part == nil then
                 return nil
             end
+
             left = left - #part
+
             if left == 0 then
                 return part
             end
+
             coroutine.yield(part)
         end
     end)
@@ -317,19 +395,27 @@ local function build(options)
     if type(options) ~= "table" or type(options.root) ~= "string" or options.root == "" then
         error("static: the root option must name a directory", 3)
     end
+
     local root = options.root
+
     if #root > 1 and root:sub(-1) == "/" then
         root = root:sub(1, -2)
     end
+
     local ok, kind = catch fs.type(root)
+
     if not ok or kind ~= "directory" then
         error(`static: root '$root' is not a directory`, 3)
     end
+
     local dotfiles = options.dotfiles or "ignore"
+
     if dotfiles ~= "ignore" and dotfiles ~= "deny" and dotfiles ~= "allow" then
         error("static: dotfiles must be 'ignore', 'deny', or 'allow'", 3)
     end
+
     local index = options.index
+
     if index == nil then
         index = { "index.html" }
     elseif index == false then
@@ -337,23 +423,29 @@ local function build(options)
     elseif type(index) == "string" then
         index = { index }
     end
+
     local follow_links = options.links == true
     local fallback = options.fallback
     local windows = os.platform() == "windows"
     local cache_control
+
     if options.max_age ~= false then
         cache_control = `public, max-age=$(math.floor(options.max_age or 0))`
+
         if options.immutable then
-            cache_control = cache_control .. ", immutable"
+            cache_control = `$cache_control, immutable`
         end
     end
+
     local extra = options.headers
     local types = M.types
     local caching = options.cache == true
     local stream_threshold = options.stream_threshold or 256 * 1024
+
     if math.type(stream_threshold) ~= "integer" or stream_threshold < 0 then
         error("static: stream_threshold must be a size in bytes", 3)
     end
+
     local cache_limit = options.cache_limit or 64 * 1024 * 1024
     local cached, cached_bytes = {}, 0
 
@@ -362,19 +454,24 @@ local function build(options)
     local function entry_kind(segments, count)
         local path = root
         local entry_ok, entry, link
+
         if follow_links then
-            path = count > 0 and (`$root/$(concat(segments, "/", 1, count))`) or root
+            path = count > 0 and `$root/$(concat(segments, "/", 1, count))` or root
             entry_ok, entry = catch fs.type(path)
             return entry_ok and entry or nil, path
         end
+
         entry = "directory"
+
         for i = 1, count do
             path = `$path/$(segments[i])`
             entry_ok, entry, link = catch fs.type(path)
+
             if not entry_ok or link then
                 return nil, path
             end
         end
+
         return entry, path
     end
 
@@ -389,10 +486,13 @@ local function build(options)
         if entry = cached[path] then
             return entry
         end
+
         local found, info = catch fs.stat(path)
+
         if not found or info.kind ~= "file" then
             return nil
         end
+
         local size = info.size
         local modified = info.modified
         local seconds = modified:epoch()
@@ -405,30 +505,38 @@ local function build(options)
             date = http_date(seconds),
             mime = mime_of(path),
         }
+
         if size > stream_threshold then
             -- The response streams a large file from the disk, so the cache
             -- keeps its size and its validators only.
             if caching then
                 cached[path] = entry
             end
+
             return entry
         end
-        local file = io.open(path, "rb")
+
+        local file <close> = io.open(path, "rb")
+
         if file == nil then
             return nil
         end
+
         local read_ok, body = catch file:read("a")
-        file:close()
+
         if not read_ok then
             return nil
         end
+
         body = body or ""
         entry.body = body
         entry.size = #body
+
         if caching and cached_bytes + entry.size <= cache_limit then
             cached[path] = entry
             cached_bytes = cached_bytes + entry.size
         end
+
         return entry
     end
 
@@ -440,16 +548,19 @@ local function build(options)
             ["Accept-Ranges"] = "bytes",
             ["Cache-Control"] = cache_control,
         }
+
         if extra then
             for k, v in pairs(extra) do
                 headers[k] = v
             end
         end
+
         return headers
     end
 
     local function send(entry, method, request)
         local headers = base_headers(entry)
+
         if none_match = request["if-none-match"] then
             if etag_listed(none_match, entry.etag) then
                 headers["Content-Type"] = nil
@@ -457,48 +568,60 @@ local function build(options)
             end
         elseif since_text = request["if-modified-since"] then
             local since = parse_http_date(since_text)
+
             if since and entry.modified <= since then
                 headers["Content-Type"] = nil
                 return 304, "", headers
             end
         end
+
         local size = entry.size
         local status, body = 200, entry.body
         local first, last = 0, size - 1
+
         if range = request.range then
             -- An If-Range compares strongly, so a tag with `W/` differs.
             local condition = request["if-range"]
+
             if condition == nil or condition == entry.etag or condition == entry.date then
                 local start, stop = parse_range(range, size)
+
                 if start == false then
-                    headers["Content-Range"] = `bytes */$(size)`
+                    headers["Content-Range"] = `bytes */$size`
                     headers["Content-Type"] = TEXT
-                        return 416, "range not satisfiable", headers
+                    return 416, "range not satisfiable", headers
                 elseif start ~= nil then
                     status = 206
-                    headers["Content-Range"] = `bytes $(start)-$(stop)/$(size)`
+                    headers["Content-Range"] = `bytes $start-$stop/$size`
                     first, last = start, stop
+
                     if body then
                         body = body[start + 1, stop + 1]
                     end
                 end
             end
         end
+
         local length = last - first + 1
+
         if method == "HEAD" then
             headers["Content-Length"] = tostring(length)
             return status, "", headers
         end
+
         if body == nil then
             -- A large file goes out as a stream of its parts. The length
             -- is known, so the response declares it.
             local file = io.open(entry.path, "rb")
+
             if file == nil then
                 return plain(404, "not found")
             end
+
             headers["Content-Length"] = tostring(length)
             body = stream(file, first, length)
         end
+
         return status, body, headers
     end
 
@@ -508,31 +631,47 @@ local function build(options)
         if method ~= "GET" and method ~= "HEAD" then
             return plain(405, "method not allowed", { Allow = "GET, HEAD" })
         end
+
         local segments, trailing = resolve(path, dotfiles, windows)
+
         if segments == nil then
             local status = trailing
-            return plain(status, status == 400 and "bad request" or status == 403 and "forbidden" or "not found")
+            return plain(
+                status,
+                status == 400 and "bad request" or status == 403 and "forbidden" or "not found"
+            )
         end
+
         local count = #segments
+
         if caching and not trailing then
             -- A file in the cache is served without a look at the disk.
             if hit = cached[`$root/$(concat(segments, "/"))`] then
                 return send(hit, method, request)
             end
         end
+
         local entry_type, full = entry_kind(segments, count)
+
         if entry_type == "directory" then
             if not trailing then
                 local encoded = {}
+
                 for i = 1, count do
                     encoded[i] = encode_segment(segments[i])
                 end
-                return plain(301, "", { Location = `$mount/$(concat(encoded, "/"))$(count > 0 and "/" or "")` })
+
+                return plain(301, "", {
+                    Location = `$mount/$(concat(encoded, "/"))$(count > 0 and "/" or "")`,
+                })
             end
+
             entry_type = nil
+
             for _, name in ipairs(index) do
                 segments[count + 1] = name
                 local candidate, candidate_path = entry_kind(segments, count + 1)
+
                 if candidate == "file" then
                     entry_type, full = candidate, candidate_path
                     break
@@ -541,14 +680,18 @@ local function build(options)
         elseif entry_type == "file" and trailing then
             entry_type = nil
         end
+
         local entry = entry_type == "file" and load(full) or nil
+
         if entry == nil and fallback then
             local candidate, candidate_path = entry_kind({ fallback }, 1)
             entry = candidate == "file" and load(candidate_path) or nil
         end
+
         if entry == nil then
             return plain(404, "not found")
         end
+
         return send(entry, method, request)
     end
 end
@@ -609,21 +752,28 @@ end
 function M.handler(options)
     local serve = build(options)
     local prefix = options.prefix or ""
+
     if prefix:sub(-1) == "/" then
         prefix = prefix:sub(1, -2)
     end
+
     local length = #prefix
+
     return function(req)
         local path = req.path
+
         if length > 0 then
             if path:sub(1, length) ~= prefix then
                 return plain(404, "not found")
             end
+
             path = path:sub(length + 1)
+
             if path ~= "" and path:sub(1, 1) ~= "/" then
                 return plain(404, "not found")
             end
         end
+
         return serve(req.method, path, req.headers, prefix)
     end
 end
@@ -640,13 +790,17 @@ end
 function M.register(scope, options)
     local serve = build(options)
     local mount = scope.prefix
+
     if mount:sub(-1) == "/" then
         mount = mount:sub(1, -2)
     end
+
     local skip = #mount + 1
+
     local function route(req)
         return serve(req.method, req.path:sub(skip), req.headers, mount)
     end
+
     scope:get("/*", route)
     scope:head("/*", route)
 end
